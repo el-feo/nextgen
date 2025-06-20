@@ -38,6 +38,7 @@ module Nextgen
         generate_membership_model
         add_user_model_associations
         generate_tenant_scoped_concern unless @skip_concerns
+        generate_tenant_scoping_initializer
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -466,6 +467,17 @@ module Nextgen
         rescue => e
           false
         end
+      end
+
+      # Generate tenant scoping initializer with query monitoring setup
+      def generate_tenant_scoping_initializer
+        log_step "Generating tenant scoping initializer...", :info
+
+        destination_file = "config/initializers/tenant_scoping.rb"
+
+        template "tenant_scoping_initializer.rb.erb", destination_file
+
+        log_step "✓ Generated #{destination_file}", :success
       end
 
       # Validate that a model name is a valid Ruby class name

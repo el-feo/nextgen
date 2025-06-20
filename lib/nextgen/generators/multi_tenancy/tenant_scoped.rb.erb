@@ -13,6 +13,7 @@ module TenantScoped
   class TenantScopingError < SecurityError; end
   class AdminAuthorizationError < TenantScopingError; end
   class CrossTenantAccessError < TenantScopingError; end
+  class UnscopedQueryError < TenantScopingError; end
 
   included do
     # Add belongs_to association to the organization
@@ -45,6 +46,11 @@ module TenantScoped
 
     # Add organization validation for updates as well
     before_update :ensure_<%= @organization_name.underscore %>_not_changed
+
+    # Register this model for query monitoring
+    after_initialize do
+      TenantScoped.register_tenant_scoped_model(self.class)
+    end
   end
 
   # Class methods for managing organization context and providing controlled bypass operations
@@ -106,7 +112,15 @@ module TenantScoped
       # Log all bypass operations for audit trail
       TenantScoped.log_bypass_operation(self.name, 'without_tenant_scoping', { caller: caller(1).first })
 
-      unscoped(&block)
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        unscoped(&block)
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
+      end
     end
 
     # Safely bypass scoping with explicit admin authorization check
@@ -130,7 +144,15 @@ module TenantScoped
         admin_verified: admin_check ? 'Yes' : 'No'
       })
 
-      unscoped(&block)
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        unscoped(&block)
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
+      end
     end
 
     # Bypass scoping for specific organization (admin cross-tenant operations)
@@ -214,10 +236,18 @@ module TenantScoped
 
       TenantScoped.log_bypass_operation(self.name, 'without_tenant_scoping_readonly')
 
-      # Return read-only relation to prevent accidental modifications
-      unscoped do
-        relation = yield
-        relation.respond_to?(:readonly) ? relation.readonly : relation
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        # Return read-only relation to prevent accidental modifications
+        unscoped do
+          relation = yield
+          relation.respond_to?(:readonly) ? relation.readonly : relation
+        end
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
       end
     end
 
@@ -365,6 +395,141 @@ module TenantScoped
 
     Rails.logger.public_send(BYPASS_AUDIT_LOG_LEVEL, "[TENANT_AUDIT] #{log_data.to_json}")
   end
+
+  # Query monitoring for unscoped query detection in production
+  # This system monitors SQL queries to detect and prevent unscoped queries that could lead to data leakage
+
+  # Initialize query monitoring (call this in an initializer)
+  def self.setup_query_monitoring!
+    return unless Rails.env.production?
+    return if @query_monitoring_setup
+
+    # Track models that should have tenant scoping
+    @tenant_scoped_models = Set.new
+
+    # Monitor SQL queries for unscoped operations
+    ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
+      next unless should_monitor_query?(event)
+
+      sql = event.payload[:sql]
+      name = event.payload[:name]
+      connection = event.payload[:connection]
+
+      detect_unscoped_query(sql, name, connection, event)
+    end
+
+    @query_monitoring_setup = true
+    Rails.logger.info("[TENANT_MONITOR] Query monitoring for tenant scoping enabled")
+  end
+
+  # Register a model as requiring tenant scoping
+  def self.register_tenant_scoped_model(model_class)
+    @tenant_scoped_models ||= Set.new
+    @tenant_scoped_models.add(model_class.table_name)
+    Rails.logger.debug("[TENANT_MONITOR] Registered #{model_class.name} for tenant scoping monitoring")
+  end
+
+  # Check if we should monitor this query
+  def self.should_monitor_query?(event)
+    # Skip non-production environments unless explicitly enabled
+    return false unless Rails.env.production? || ENV['TENANT_SCOPING_MONITOR'] == 'true'
+
+    # Skip certain query types that don't need monitoring
+    name = event.payload[:name]
+    sql = event.payload[:sql]
+
+    # Skip schema queries, migrations, and Rails internal queries
+    return false if name&.match?(/SCHEMA|Migration|ActiveRecord::|Rails::/)
+    return false if sql&.match?(/information_schema|pg_|sqlite_|PRAGMA|SHOW/)
+
+    # Skip queries during bypasses (thread-local flag)
+    return false if Thread.current[:tenant_scoping_bypass_active]
+
+    true
+  end
+
+  # Detect potentially unscoped queries
+  def self.detect_unscoped_query(sql, name, connection, event)
+    return unless @tenant_scoped_models&.any?
+
+    # Check if this query touches tenant-scoped tables without proper filtering
+    @tenant_scoped_models.each do |table_name|
+      next unless sql.match?(/FROM\s+["`]?#{table_name}["`]?|JOIN\s+["`]?#{table_name}["`]?/i)
+
+      # Look for organization_id filtering in the WHERE clause
+      unless has_organization_filter?(sql, table_name)
+        handle_unscoped_query_violation(sql, name, table_name, event)
+      end
+    end
+  end
+
+  # Check if SQL has proper organization filtering
+  def self.has_organization_filter?(sql, table_name)
+    # Look for organization_id in WHERE clause (various formats)
+    patterns = [
+      /WHERE.*#{table_name}["`]?\.["`]?<%= @organization_name.underscore %>_id\s*[=]/i,
+      /WHERE.*["`]?<%= @organization_name.underscore %>_id["`]?\s*[=]/i,
+      /AND.*#{table_name}["`]?\.["`]?<%= @organization_name.underscore %>_id\s*[=]/i,
+      /AND.*["`]?<%= @organization_name.underscore %>_id["`]?\s*[=]/i
+    ]
+
+    patterns.any? { |pattern| sql.match?(pattern) }
+  end
+
+  # Handle unscoped query violations
+  def self.handle_unscoped_query_violation(sql, name, table_name, event)
+    caller_info = caller(6..10)&.join("\n") || "Unknown caller"
+
+    violation_data = {
+      sql: sql,
+      query_name: name,
+      table: table_name,
+      timestamp: Time.current,
+      environment: Rails.env,
+      caller: caller_info,
+      current_org_id: current_<%= @organization_name.underscore %>_id,
+      connection_id: event.payload[:connection]&.object_id
+    }
+
+    # Log the violation
+    Rails.logger.error("[TENANT_VIOLATION] Unscoped query detected: #{violation_data.to_json}")
+
+    # In production, this could be configured to:
+    # 1. Just log (current behavior)
+    # 2. Send alerts to monitoring systems
+    # 3. Raise an exception (strict mode)
+
+    if ENV['TENANT_SCOPING_STRICT'] == 'true'
+      raise UnscopedQueryError, "Unscoped query detected on table '#{table_name}': #{sql.truncate(200)}"
+    end
+
+    # Optional: Send to external monitoring (uncomment and configure as needed)
+    # send_unscoped_query_alert(violation_data)
+  end
+
+  # Send alerts to external monitoring systems (implement as needed)
+  # def self.send_unscoped_query_alert(violation_data)
+  #   # Example: Send to error tracking service
+  #   # Bugsnag.notify(UnscopedQueryError.new("Unscoped query detected"), violation_data)
+  #   #
+  #   # Example: Send to metrics service
+  #   # StatsD.increment("tenant_scoping.unscoped_query", tags: { table: violation_data[:table] })
+  # end
+
+  # Enable/disable query monitoring
+  def self.enable_query_monitoring!
+    @query_monitoring_disabled = false
+    Rails.logger.info("[TENANT_MONITOR] Query monitoring enabled")
+  end
+
+  def self.disable_query_monitoring!
+    @query_monitoring_disabled = true
+    Rails.logger.warn("[TENANT_MONITOR] Query monitoring disabled")
+  end
+
+  def self.query_monitoring_disabled?
+    @query_monitoring_disabled || false
+  end
 end
 
 # ApplicationController helper methods for setting organization context
@@ -445,3 +610,45 @@ module TenantScoped::ControllerHelpers
     end
   end
 end
+
+# SETUP INSTRUCTIONS FOR QUERY MONITORING
+#
+# Add this to your Rails application initializer (config/initializers/tenant_scoping.rb):
+#
+#   if Rails.env.production?
+#     TenantScoped.setup_query_monitoring!
+#   end
+#
+# ENVIRONMENT VARIABLES:
+#
+# TENANT_SCOPING_MONITOR=true    - Enable monitoring in non-production environments
+# TENANT_SCOPING_STRICT=true     - Raise exceptions instead of just logging violations
+#
+# PRODUCTION DEPLOYMENT CHECKLIST:
+#
+# 1. Set up query monitoring in initializer
+# 2. Configure error tracking (Bugsnag, Sentry, etc.) to capture UnscopedQueryError
+# 3. Set up metrics/alerting for tenant scoping violations
+# 4. Monitor logs for [TENANT_VIOLATION] entries
+# 5. Consider enabling TENANT_SCOPING_STRICT after thorough testing
+#
+# EXAMPLE USAGE:
+#
+# # Safe bypass for admin operations
+# User.with_admin_bypass(
+#   admin_check: -> { current_user&.admin? },
+#   reason: "Generating cross-tenant report"
+# ) do
+#   User.joins(:memberships).group(:organization_id).count
+# end
+#
+# # Data migration example
+# User.without_tenant_scoping do
+#   User.where(organization_id: nil).update_all(organization_id: default_org.id)
+# end
+#
+# # Multi-tenant operations
+# User.for_each_organization(admin_check: -> { current_user&.super_admin? }) do |org|
+#   # Process each organization's data safely
+#   puts "Processing #{org.name}: #{User.count} users"
+# end
