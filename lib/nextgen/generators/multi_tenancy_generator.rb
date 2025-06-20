@@ -14,26 +14,26 @@ module Nextgen
 
       # Check for Rails 8 compatibility and detect test framework
       def check_compatibility
-        say "Checking Rails compatibility...", :green
+        log_step "Checking Rails compatibility...", :info
 
         unless rails_version_compatible?
-          say "ERROR: This generator requires Rails 6.0 or higher. Current version: #{Rails.version}", :red
+          log_step "This generator requires Rails 6.0 or higher. Current version: #{Rails.version}", :error
           exit(1)
         end
 
-        say "✓ Rails #{Rails.version} detected", :green
+        log_step "Rails #{Rails.version} detected", :success
 
         @test_framework = detect_test_framework
-        say "✓ Test framework: #{@test_framework}", :green
+        log_step "Test framework: #{@test_framework}", :success
       end
 
       # Validate that User model exists
       def validate_user_model
-        say "Validating User model...", :green
+        log_step "Validating User model...", :info
 
         unless user_model_exists?
+          log_step "User model not found!", :error
           say <<~ERROR, :red
-            ERROR: User model not found!
 
             This generator requires a User model to exist in your application.
             Please create a User model first:
@@ -46,7 +46,7 @@ module Nextgen
           exit(1)
         end
 
-        say "✓ User model found", :green
+        log_step "User model found", :success
       end
 
       # Get user confirmation before making changes
@@ -70,6 +70,48 @@ module Nextgen
         say "  NEXTGEN MULTI-TENANCY GENERATOR", :cyan
         say "="*60, :cyan
         say "Starting multi-tenancy setup for your Rails application...\n", :green
+      end
+
+      # Enhanced logging methods for consistent user feedback
+      def log_step(message, status = :info)
+        case status
+        when :success
+          say "✓ #{message}", :green
+        when :info
+          say "→ #{message}", :blue
+        when :warning
+          say "⚠ #{message}", :yellow
+        when :error
+          say "✗ #{message}", :red
+        when :progress
+          say "• #{message}", :cyan
+        else
+          say message, :white
+        end
+      end
+
+      def log_section(title)
+        say "\n" + "-" * 50, :cyan
+        say "#{title}", :cyan
+        say "-" * 50, :cyan
+      end
+
+      def log_completion(message = "Multi-tenancy setup completed successfully!")
+        say "\n" + "="*60, :green
+        say "  #{message}", :green
+        say "="*60, :green
+      end
+
+      def log_file_action(action, file_path, details = nil)
+        case action
+        when :create
+          say "      create  #{file_path}", :green
+        when :modify
+          say "      modify  #{file_path}", :yellow
+        when :skip
+          say "      skip    #{file_path} (already exists)", :yellow
+        end
+        say "              #{details}", :light_blue if details
       end
 
       private
