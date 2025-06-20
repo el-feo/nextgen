@@ -8,8 +8,84 @@ module Nextgen
     class MultiTenancyGenerator < Rails::Generators::Base
       desc "Add multi-tenancy support to your Rails application with organizations, roles, and tenant scoping"
 
+      # Define class options for generator configuration
+      class_option :skip_tests, type: :boolean, default: false, desc: "Skip generating tests"
+      class_option :skip_concerns, type: :boolean, default: false, desc: "Skip generating tenant scoping concerns"
+      class_option :skip_migrations, type: :boolean, default: false, desc: "Skip generating migrations"
+      class_option :organization_name, type: :string, default: "Organization", desc: "Name for the organization model"
+      class_option :role_name, type: :string, default: "Role", desc: "Name for the role model"
+      class_option :membership_name, type: :string, default: "Membership", desc: "Name for the membership model"
+      class_option :tenant_column, type: :string, default: "organization_id", desc: "Column name for tenant foreign key"
+      class_option :force_overwrite, type: :boolean, default: false, desc: "Force overwrite existing files without prompting"
+
       def self.exit_on_failure?
         true
+      end
+
+      # Main generator execution flow
+      def execute
+        log_section "NEXTGEN MULTI-TENANCY GENERATOR"
+        parse_and_validate_options
+        check_compatibility
+        validate_user_model
+        get_user_confirmation unless options[:force_overwrite]
+        # TODO: Continue with model generation, migrations, etc.
+        log_completion("Multi-tenancy argument parsing and validation completed successfully!")
+      end
+
+      private
+
+      # Parse and validate generator options
+      def parse_and_validate_options
+        log_step "Parsing generator options...", :info
+        
+        # Validate organization name
+        @organization_name = options[:organization_name].classify
+        unless valid_model_name?(@organization_name)
+          log_step "Invalid organization name: #{options[:organization_name]}", :error
+          say "Organization name must be a valid Ruby class name", :red
+          exit(1)
+        end
+
+        # Validate role name
+        @role_name = options[:role_name].classify
+        unless valid_model_name?(@role_name)
+          log_step "Invalid role name: #{options[:role_name]}", :error
+          say "Role name must be a valid Ruby class name", :red
+          exit(1)
+        end
+
+        # Validate membership name
+        @membership_name = options[:membership_name].classify
+        unless valid_model_name?(@membership_name)
+          log_step "Invalid membership name: #{options[:membership_name]}", :error
+          say "Membership name must be a valid Ruby class name", :red
+          exit(1)
+        end
+
+        # Validate tenant column name
+        @tenant_column = options[:tenant_column].underscore
+        unless valid_column_name?(@tenant_column)
+          log_step "Invalid tenant column name: #{options[:tenant_column]}", :error
+          say "Tenant column must be a valid database column name", :red
+          exit(1)
+        end
+
+        # Store configuration flags
+        @skip_tests = options[:skip_tests]
+        @skip_concerns = options[:skip_concerns] 
+        @skip_migrations = options[:skip_migrations]
+        @force_overwrite = options[:force_overwrite]
+
+        log_step "Configuration parsed successfully:", :success
+        log_step "  Organization model: #{@organization_name}", :progress
+        log_step "  Role model: #{@role_name}", :progress
+        log_step "  Membership model: #{@membership_name}", :progress
+        log_step "  Tenant column: #{@tenant_column}", :progress
+        log_step "  Skip tests: #{@skip_tests}", :progress
+        log_step "  Skip concerns: #{@skip_concerns}", :progress
+        log_step "  Skip migrations: #{@skip_migrations}", :progress
+        log_step "  Force overwrite: #{@force_overwrite}", :progress
       end
 
       # Check for Rails 8 compatibility and detect test framework
@@ -67,11 +143,12 @@ module Nextgen
       # Get user confirmation before making changes
       def get_user_confirmation
         say "\nThis generator will:", :yellow
-        say "• Create Organization, Role, and Membership models"
-        say "• Add migrations for multi-tenancy tables"
-        say "• Create a TenantScoped concern for automatic scoping"
-        say "• Modify existing models to include organization_id"
+        say "• Create #{@organization_name}, #{@role_name}, and #{@membership_name} models"
+        say "• Add migrations for multi-tenancy tables" unless @skip_migrations
+        say "• Create a TenantScoped concern for automatic scoping" unless @skip_concerns
+        say "• Modify existing models to include #{@tenant_column}"
         say "• Add foreign key constraints and indexes"
+        say "• Generate test files" unless @skip_tests
 
         unless yes?("\nProceed with multi-tenancy setup? (y/n)", :yellow)
           say "Multi-tenancy setup cancelled.", :red
@@ -170,6 +247,24 @@ module Nextgen
         rescue => e
           false
         end
+      end
+
+      # Validate that a model name is a valid Ruby class name
+      def valid_model_name?(name)
+        return false if name.blank?
+        # Check if it's a valid Ruby constant name
+        name.match?(/\A[A-Z][a-zA-Z0-9_]*\z/) && name.constantize rescue false
+      rescue NameError
+        # If constantize fails, check if it's a valid format at least
+        name.match?(/\A[A-Z][a-zA-Z0-9_]*\z/)
+      end
+
+      # Validate that a column name is valid for database use
+      def valid_column_name?(name)
+        return false if name.blank?
+        # Check for valid database column name format
+        # Must start with letter or underscore, followed by letters, numbers, or underscores
+        name.match?(/\A[a-z_][a-z0-9_]*\z/) && name.length <= 63 # PostgreSQL limit
       end
     end
   end
