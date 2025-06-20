@@ -608,6 +608,183 @@ module TenantScoped::ControllerHelpers
       TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
       session[:current_<%= @organization_name.underscore %>_id] = <%= @organization_name.underscore %>.id
     end
+
+    # Explicit organization setter with authorization checking
+    # Use this for programmatic organization switching (e.g., organization selection form)
+    def set_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user: nil)
+      user = authorized_user || current_user
+      raise TenantScoped::TenantScopingError, "No user provided for organization context setting" unless user
+
+      <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
+        <%= @organization_name.underscore %>_id_or_object :
+        user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
+
+      # Verify user has access to this organization
+      unless user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
+        raise TenantScoped::CrossTenantAccessError,
+          "User #{user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
+      end
+
+      TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+      session[:current_<%= @organization_name.underscore %>_id] = <%= @organization_name.underscore %>.id if respond_to?(:session)
+
+      Rails.logger.info("Organization context set to #{<%= @organization_name.underscore %>.id} for user #{user.id}")
+      <%= @organization_name.underscore %>
+    end
+
+    # Clear organization context (useful for logout or context reset)
+    def clear_<%= @organization_name.underscore %>_context!
+      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
+      session[:current_<%= @organization_name.underscore %>_id] = nil if respond_to?(:session)
+      Rails.logger.debug("Organization context cleared")
+    end
+
+    # Temporarily execute a block with a different organization context
+    # Useful for cross-tenant operations that the current user is authorized for
+    def with_<%= @organization_name.underscore %>_context(<%= @organization_name.underscore %>_id_or_object, authorized_user: nil, &block)
+      user = authorized_user || current_user
+      raise TenantScoped::TenantScopingError, "No user provided for temporary organization context" unless user
+
+      <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
+        <%= @organization_name.underscore %>_id_or_object :
+        user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
+
+      # Verify user has access to this organization
+      unless user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
+        raise TenantScoped::CrossTenantAccessError,
+          "User #{user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
+      end
+
+      TenantScoped.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>, &block)
+    end
+
+    # Validate current organization context
+    def validate_<%= @organization_name.underscore %>_context!(user: nil)
+      user ||= current_user
+      current_<%= @organization_name.underscore %>_obj = TenantScoped.current_<%= @organization_name.underscore %>
+
+      unless current_<%= @organization_name.underscore %>_obj
+        raise TenantScoped::TenantScopingError, "No organization context set"
+      end
+
+      if user && !user.<%= @organization_name.underscore.pluralize %>.include?(current_<%= @organization_name.underscore %>_obj)
+        raise TenantScoped::CrossTenantAccessError,
+          "User #{user.id} does not have access to current organization #{current_<%= @organization_name.underscore %>_obj.id}"
+      end
+
+      current_<%= @organization_name.underscore %>_obj
+    end
+  end
+end
+
+# Service and background job helper methods for organization context
+# Include this in your service objects and background jobs
+#
+# USAGE EXAMPLES:
+#
+# class ReportGenerationService
+#   include TenantScoped::ServiceHelpers
+#
+#   def initialize(user:)
+#     @user = user
+#     ensure_organization_context!(@user)
+#   end
+#
+#   def generate_report
+#     # All queries here will be automatically scoped to the current organization
+#     User.count # Only counts users in current organization
+#   end
+# end
+#
+# class BackgroundReportJob < ApplicationJob
+#   include TenantScoped::ServiceHelpers
+#
+#   def perform(user_id, organization_id)
+#     user = User.unscoped.find(user_id)
+#     execute_with_organization_context(organization_id, authorized_user: user) do
+#       # Job logic here - all queries scoped to organization
+#       generate_and_email_report
+#     end
+#   end
+# end
+module TenantScoped::ServiceHelpers
+  extend ActiveSupport::Concern
+
+  # Set organization context for service operations
+  # Call this at the beginning of service methods that need tenant scoping
+  def set_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user:)
+    raise TenantScoped::TenantScopingError, "No user provided for service organization context" unless authorized_user
+
+    <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
+      <%= @organization_name.underscore %>_id_or_object :
+      authorized_user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
+
+    # Verify user has access to this organization
+    unless authorized_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
+      raise TenantScoped::CrossTenantAccessError,
+        "User #{authorized_user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
+    end
+
+    TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+    Rails.logger.info("Service organization context set to #{<%= @organization_name.underscore %>.id} for user #{authorized_user.id}")
+    <%= @organization_name.underscore %>
+  end
+
+  # Ensure organization context is set, raise error if not
+  # Use this for services that require organization context
+  def ensure_<%= @organization_name.underscore %>_context!(user: nil)
+    current_<%= @organization_name.underscore %>_obj = TenantScoped.current_<%= @organization_name.underscore %>
+
+    unless current_<%= @organization_name.underscore %>_obj
+      raise TenantScoped::TenantScopingError, "Organization context required but not set"
+    end
+
+    if user && !user.<%= @organization_name.underscore.pluralize %>.include?(current_<%= @organization_name.underscore %>_obj)
+      raise TenantScoped::CrossTenantAccessError,
+        "User #{user.id} does not have access to current organization #{current_<%= @organization_name.underscore %>_obj.id}"
+    end
+
+    current_<%= @organization_name.underscore %>_obj
+  end
+
+  # Execute a block with organization context set
+  # Useful for background jobs and service methods
+  def execute_with_<%= @organization_name.underscore %>_context(<%= @organization_name.underscore %>_id_or_object, authorized_user:, &block)
+    raise TenantScoped::TenantScopingError, "No block provided" unless block_given?
+
+    <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
+      <%= @organization_name.underscore %>_id_or_object :
+      authorized_user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
+
+    # Verify user has access to this organization
+    unless authorized_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
+      raise TenantScoped::CrossTenantAccessError,
+        "User #{authorized_user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
+    end
+
+    TenantScoped.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>, &block)
+  end
+
+  # Clear organization context (useful for cleanup)
+  def clear_service_<%= @organization_name.underscore %>_context!
+    TenantScoped.current_<%= @organization_name.underscore %>_id = nil
+    Rails.logger.debug("Service organization context cleared")
+  end
+
+  # Get current organization for service operations
+  def current_service_<%= @organization_name.underscore %>
+    TenantScoped.current_<%= @organization_name.underscore %>
+  end
+
+  # Switch organization context for cross-tenant service operations
+  # Use with extreme caution - ensure proper authorization
+  def switch_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user:, admin_check: nil)
+    # Extra authorization check for cross-tenant operations
+    if admin_check && !admin_check.call
+      raise TenantScoped::AdminAuthorizationError, "Admin authorization required for cross-tenant service operation"
+    end
+
+    set_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user: authorized_user)
   end
 end
 
@@ -651,4 +828,94 @@ end
 # User.for_each_organization(admin_check: -> { current_user&.super_admin? }) do |org|
 #   # Process each organization's data safely
 #   puts "Processing #{org.name}: #{User.count} users"
+# end
+#
+# CONTROLLER USAGE EXAMPLES:
+#
+# # In ApplicationController:
+# class ApplicationController < ActionController::Base
+#   include TenantScoped::ControllerHelpers
+#   # Automatic organization context setting via before_action
+# end
+#
+# # Manual organization context setting:
+# def switch_organization
+#   org = set_organization_context!(params[:organization_id])
+#   redirect_to dashboard_path, notice: "Switched to #{org.name}"
+# rescue TenantScoped::CrossTenantAccessError => e
+#   redirect_to organizations_path, alert: e.message
+# end
+#
+# # Temporary cross-tenant operations:
+# def admin_report
+#   with_organization_context(params[:target_org_id]) do
+#     @users = User.all # Scoped to target organization
+#     @projects = Project.all # Also scoped to target organization
+#   end
+# end
+#
+# # Context validation:
+# before_action :validate_organization_context!
+#
+# SERVICE USAGE EXAMPLES:
+#
+# # Service object with organization context:
+# class ReportGenerationService
+#   include TenantScoped::ServiceHelpers
+#
+#   def initialize(user:, organization_id: nil)
+#     @user = user
+#     if organization_id
+#       set_service_organization_context!(organization_id, authorized_user: @user)
+#     else
+#       ensure_organization_context!(user: @user)
+#     end
+#   end
+#
+#   def generate_report
+#     # All queries automatically scoped to current organization
+#     {
+#       users_count: User.count,
+#       projects_count: Project.count,
+#       organization: current_service_organization.name
+#     }
+#   end
+# end
+#
+# # Background job with organization context:
+# class WeeklyReportJob < ApplicationJob
+#   include TenantScoped::ServiceHelpers
+#
+#   def perform(user_id, organization_id)
+#     user = User.unscoped.find(user_id)
+#     execute_with_organization_context(organization_id, authorized_user: user) do
+#       # All database operations here are scoped to the organization
+#       report_data = generate_weekly_report
+#       ReportMailer.weekly_report(user, report_data).deliver_now
+#     end
+#   rescue TenantScoped::CrossTenantAccessError => e
+#     Rails.logger.error("Job authorization failed: #{e.message}")
+#     raise
+#   end
+# end
+#
+# # Cross-tenant admin service:
+# class CrossTenantAuditService
+#   include TenantScoped::ServiceHelpers
+#
+#   def perform_audit(admin_user:, target_organization_ids:)
+#     ensure_admin_authorized!(admin_user)
+#
+#     target_organization_ids.each do |org_id|
+#       switch_service_organization_context!(
+#         org_id,
+#         authorized_user: admin_user,
+#         admin_check: -> { admin_user.super_admin? }
+#       )
+#
+#       audit_organization_data
+#     end
+#   ensure
+#     clear_service_organization_context!
+#   end
 # end
