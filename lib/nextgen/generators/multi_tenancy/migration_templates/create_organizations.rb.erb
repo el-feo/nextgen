@@ -1,0 +1,22 @@
+class Create<%= @organization_name.pluralize %> < ActiveRecord::Migration[<%= Rails.version.to_f %>]
+  def change
+    create_table :<%= @organization_name.underscore.pluralize %> do |t|
+      t.string :name, null: false, limit: 100
+      t.boolean :archived, default: false, null: false
+      t.text :description
+
+      t.timestamps null: false
+    end
+
+    # Add indexes for performance
+    add_index :<%= @organization_name.underscore.pluralize %>, :name
+    add_index :<%= @organization_name.underscore.pluralize %>, :archived
+    add_index :<%= @organization_name.underscore.pluralize %>, [:name, :archived]
+
+    # Add unique constraint for organization names (case-insensitive)
+    add_index :<%= @organization_name.underscore.pluralize %>,
+              "LOWER(name)",
+              unique: true,
+              name: "index_<%= @organization_name.underscore.pluralize %>_on_lower_name"
+  end
+end

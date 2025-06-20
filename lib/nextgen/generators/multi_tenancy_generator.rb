@@ -8,6 +8,9 @@ module Nextgen
     class MultiTenancyGenerator < Rails::Generators::Base
       desc "Add multi-tenancy support to your Rails application with organizations, roles, and tenant scoping"
 
+      # Set the source root for templates
+      source_root File.expand_path("multi_tenancy", __dir__)
+
       # Define class options for generator configuration
       class_option :skip_tests, type: :boolean, default: false, desc: "Skip generating tests"
       class_option :skip_concerns, type: :boolean, default: false, desc: "Skip generating tenant scoping concerns"
@@ -29,8 +32,10 @@ module Nextgen
         check_compatibility
         validate_user_model
         get_user_confirmation unless options[:force_overwrite]
-        # TODO: Continue with model generation, migrations, etc.
-        log_completion("Multi-tenancy argument parsing and validation completed successfully!")
+
+        generate_organization_model
+
+        log_completion("Multi-tenancy setup completed successfully!")
       end
 
       private
@@ -38,7 +43,7 @@ module Nextgen
       # Parse and validate generator options
       def parse_and_validate_options
         log_step "Parsing generator options...", :info
-        
+
         # Validate organization name
         @organization_name = options[:organization_name].classify
         unless valid_model_name?(@organization_name)
@@ -73,7 +78,7 @@ module Nextgen
 
         # Store configuration flags
         @skip_tests = options[:skip_tests]
-        @skip_concerns = options[:skip_concerns] 
+        @skip_concerns = options[:skip_concerns]
         @skip_migrations = options[:skip_migrations]
         @force_overwrite = options[:force_overwrite]
 
@@ -204,6 +209,44 @@ module Nextgen
           say "      skip    #{file_path} (already exists)", :yellow
         end
         say "              #{details}", :light_blue if details
+      end
+
+      # Generate the Organization model
+      def generate_organization_model
+        log_section "GENERATING ORGANIZATION MODEL"
+        log_step "Creating #{@organization_name} model...", :info
+
+        model_file_path = "app/models/#{@organization_name.underscore}.rb"
+
+        if File.exist?(model_file_path) && !@force_overwrite
+          log_file_action :skip, model_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "organization.rb.erb",
+            model_file_path
+          )
+          log_file_action :create, model_file_path, "Multi-tenant organization model with validations and indexes"
+        end
+
+        # Generate migration unless skipped
+        unless @skip_migrations
+          generate_organization_migration
+        end
+
+        log_step "#{@organization_name} model created successfully", :success
+      end
+
+      # Generate the migration for organizations table
+      def generate_organization_migration
+        log_step "Creating migration for #{@organization_name.underscore.pluralize} table...", :info
+
+        migration_template(
+          "migration_templates/create_organizations.rb.erb",
+          "db/migrate/create_#{@organization_name.underscore.pluralize}.rb"
+        )
+
+        log_file_action :create, "db/migrate/create_#{@organization_name.underscore.pluralize}.rb",
+                       "Migration with proper indexes and constraints"
       end
 
       private

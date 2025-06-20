@@ -1,0 +1,57 @@
+# frozen_string_literal: true
+
+# Organization model for multi-tenancy support
+# Represents the top-level tenant boundary in the application
+class <%= @organization_name %> < ApplicationRecord
+  # Associations
+  has_many :memberships, dependent: :destroy, inverse_of: :<%= @organization_name.underscore %>
+  has_many :users, through: :memberships
+
+  # Validations
+  validates :name, presence: true, length: { minimum: 2, maximum: 100 }
+  validates :name, uniqueness: { case_sensitive: false }
+
+  # Callbacks
+  before_validation :strip_whitespace
+  before_save :normalize_name
+
+  # Scopes
+  scope :active, -> { where(archived: false) }
+  scope :by_name, -> { order(:name) }
+
+  # Class methods
+  def self.find_by_name_case_insensitive(name)
+    where("LOWER(name) = LOWER(?)", name.to_s.strip).first
+  end
+
+  # Instance methods
+  def display_name
+    name.presence || "Unnamed Organization"
+  end
+
+  def user_count
+    users.count
+  end
+
+  def active?
+    !archived?
+  end
+
+  def archive!
+    update!(archived: true)
+  end
+
+  def unarchive!
+    update!(archived: false)
+  end
+
+  private
+
+  def strip_whitespace
+    self.name = name&.strip
+  end
+
+  def normalize_name
+    self.name = name&.squish if name_changed?
+  end
+end
