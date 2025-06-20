@@ -1,0 +1,202 @@
+# frozen_string_literal: true
+
+# TenantScoped concern for automatic organization-based scoping
+# This concern provides automatic tenant isolation for models that include it
+module TenantScoped
+  extend ActiveSupport::Concern
+
+  included do
+    # Add belongs_to association to the organization
+    belongs_to :<%= @organization_name.underscore %>, optional: false
+
+    # Add validation to ensure organization is present
+    validates :<%= @organization_name.underscore %>_id, presence: true
+
+    # Apply default scope to filter by current organization
+    default_scope -> { 
+      if TenantScoped.current_<%= @organization_name.underscore %>_id
+        where(<%= @organization_name.underscore %>_id: TenantScoped.current_<%= @organization_name.underscore %>_id)
+      else
+        # If no organization is set, return empty relation in production to prevent data leakage
+        # In development/test, we allow unscoped queries for easier testing
+        if Rails.env.production?
+          none
+        else
+          all
+        end
+      end
+    }
+
+    # Add index for performance on organization_id column
+    # This should be added via migration when including this concern
+    # add_index table_name, :<%= @organization_name.underscore %>_id
+
+    # Ensure new records get the current organization
+    before_validation :set_current_<%= @organization_name.underscore %>, on: :create
+
+    # Add organization validation for updates as well
+    before_update :ensure_<%= @organization_name.underscore %>_not_changed
+  end
+
+  # Class methods for managing organization context
+  module ClassMethods
+    # Temporarily bypass tenant scoping for admin operations
+    # Use with extreme caution - mainly for data migrations and admin operations
+    def without_tenant_scoping
+      if Rails.env.production?
+        Rails.logger.warn("WARNING: Bypassing tenant scoping in production. Caller: #{caller(1..3)}")
+      end
+      
+      unscoped { yield }
+    end
+
+    # Scope to a specific organization
+    def for_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
+      unscoped.where(<%= @organization_name.underscore %>_id: <%= @organization_name.underscore %>.id)
+    end
+
+    # Check if tenant scoping is currently active
+    def tenant_scoping_active?
+      TenantScoped.current_<%= @organization_name.underscore %>_id.present?
+    end
+
+    # Get current organization for this model
+    def current_<%= @organization_name.underscore %>
+      return nil unless TenantScoped.current_<%= @organization_name.underscore %>_id
+      
+      @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.find(TenantScoped.current_<%= @organization_name.underscore %>_id)
+    end
+  end
+
+  # Thread-safe storage for current organization context
+  # This ensures tenant isolation across concurrent requests
+  def self.current_<%= @organization_name.underscore %>_id
+    RequestStore.store[:current_<%= @organization_name.underscore %>_id] ||
+      Thread.current[:current_<%= @organization_name.underscore %>_id]
+  end
+
+  def self.current_<%= @organization_name.underscore %>_id=(id)
+    RequestStore.store[:current_<%= @organization_name.underscore %>_id] = id if defined?(RequestStore)
+    Thread.current[:current_<%= @organization_name.underscore %>_id] = id
+  end
+
+  def self.current_<%= @organization_name.underscore %>
+    return nil unless current_<%= @organization_name.underscore %>_id
+    
+    @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.unscoped.find(current_<%= @organization_name.underscore %>_id)
+  end
+
+  def self.current_<%= @organization_name.underscore %>=(<%= @organization_name.underscore %>)
+    self.current_<%= @organization_name.underscore %>_id = <%= @organization_name.underscore %>&.id
+    @current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+  end
+
+  # Set organization context for the duration of a block
+  def self.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
+    previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
+    previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
+    
+    self.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+    
+    yield
+  ensure
+    self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+    @current_<%= @organization_name.underscore %> = previous_<%= @organization_name.underscore %>
+  end
+
+  # Clear organization context (use with caution)
+  def self.without_<%= @organization_name.underscore %>
+    previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
+    previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
+    
+    self.current_<%= @organization_name.underscore %>_id = nil
+    @current_<%= @organization_name.underscore %> = nil
+    
+    yield
+  ensure
+    self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+    @current_<%= @organization_name.underscore %> = previous_<%= @organization_name.underscore %>
+  end
+
+  # Instance methods
+  def belongs_to_current_<%= @organization_name.underscore %>?
+    <%= @organization_name.underscore %>_id == TenantScoped.current_<%= @organization_name.underscore %>_id
+  end
+
+  def can_be_accessed_by?(<%= @organization_name.underscore %>)
+    self.<%= @organization_name.underscore %>_id == <%= @organization_name.underscore %>.id
+  end
+
+  private
+
+  def set_current_<%= @organization_name.underscore %>
+    return if <%= @organization_name.underscore %>_id.present?
+    return unless TenantScoped.current_<%= @organization_name.underscore %>_id
+
+    self.<%= @organization_name.underscore %>_id = TenantScoped.current_<%= @organization_name.underscore %>_id
+  end
+
+  def ensure_<%= @organization_name.underscore %>_not_changed
+    return unless <%= @organization_name.underscore %>_id_changed?
+
+    errors.add(:<%= @organization_name.underscore %>_id, "cannot be changed after creation")
+    throw :abort
+  end
+end
+
+# ApplicationController helper methods for setting organization context
+# Include this in your ApplicationController or a parent controller
+module TenantScoped::ControllerHelpers
+  extend ActiveSupport::Concern
+
+  included do
+    # Automatically set organization context from current user
+    before_action :set_current_<%= @organization_name.underscore %>
+
+    # Helper method available in views
+    helper_method :current_<%= @organization_name.underscore %>
+
+    private
+
+    def set_current_<%= @organization_name.underscore %>
+      return unless user_signed_in? # Adjust based on your authentication method
+      return unless respond_to?(:current_user) && current_user
+
+      # If user has only one organization, use it automatically
+      user_<%= @organization_name.underscore.pluralize %> = current_user.<%= @organization_name.underscore.pluralize %>
+      
+      if user_<%= @organization_name.underscore.pluralize %>.count == 1
+        TenantScoped.current_<%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.first
+      elsif params[:<%= @organization_name.underscore %>_id].present?
+        # Use organization from params if provided
+        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find(params[:<%= @organization_name.underscore %>_id])
+        TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+      elsif session[:current_<%= @organization_name.underscore %>_id].present?
+        # Use organization from session if user has access
+        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find_by(id: session[:current_<%= @organization_name.underscore %>_id])
+        TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %> if <%= @organization_name.underscore %>
+      end
+
+      # Store in session for future requests
+      session[:current_<%= @organization_name.underscore %>_id] = TenantScoped.current_<%= @organization_name.underscore %>_id
+    end
+
+    def current_<%= @organization_name.underscore %>
+      TenantScoped.current_<%= @organization_name.underscore %>
+    end
+
+    def require_<%= @organization_name.underscore %>
+      unless TenantScoped.current_<%= @organization_name.underscore %>
+        redirect_to <%= @organization_name.underscore.pluralize %>_path, alert: "Please select an <%= @organization_name.underscore %> to continue."
+      end
+    end
+
+    # Switch organization context (useful for organization selection)
+    def switch_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
+      return unless current_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
+
+      TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+      session[:current_<%= @organization_name.underscore %>_id] = <%= @organization_name.underscore %>.id
+    end
+  end
+end

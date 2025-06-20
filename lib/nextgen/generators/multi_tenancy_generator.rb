@@ -37,6 +37,7 @@ module Nextgen
         generate_role_model
         generate_membership_model
         add_user_model_associations
+        generate_tenant_scoped_concern unless @skip_concerns
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -400,6 +401,28 @@ module Nextgen
 
         log_file_action :modify, user_model_path, "Added multi-tenancy associations and helper methods"
         log_step "User model associations added successfully", :success
+      end
+
+      # Generate the TenantScoped concern for automatic organization scoping
+      def generate_tenant_scoped_concern
+        log_section "GENERATING TENANT SCOPED CONCERN"
+        log_step "Creating TenantScoped concern for automatic tenant isolation...", :info
+
+        concern_file_path = "app/models/concerns/tenant_scoped.rb"
+
+        if File.exist?(concern_file_path) && !@force_overwrite
+          log_file_action :skip, concern_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "tenant_scoped.rb.erb",
+            concern_file_path
+          )
+          log_file_action :create, concern_file_path, "Concern for automatic organization scoping with thread-safe context management"
+        end
+
+        log_step "TenantScoped concern created successfully", :success
+        log_step "Include 'TenantScoped' in models that need organization scoping", :info
+        log_step "Include 'TenantScoped::ControllerHelpers' in ApplicationController", :info
       end
 
       private
