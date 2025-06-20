@@ -18,13 +18,28 @@ module Nextgen
 
         unless rails_version_compatible?
           log_step "This generator requires Rails 6.0 or higher. Current version: #{Rails.version}", :error
+          say "Supported Rails versions: 6.0, 6.1, 7.0, 7.1, 8.0+", :yellow
           exit(1)
         end
 
-        log_step "Rails #{Rails.version} detected", :success
+        rails_version = Gem::Version.new(Rails.version)
+        if rails_version >= Gem::Version.new("8.0.0")
+          log_step "Rails #{Rails.version} detected (Rails 8+ compatible)", :success
+        elsif rails_version >= Gem::Version.new("7.0.0")
+          log_step "Rails #{Rails.version} detected (Rails 7.x compatible)", :success
+        else
+          log_step "Rails #{Rails.version} detected (Rails 6.x compatible)", :success
+        end
 
         @test_framework = detect_test_framework
-        log_step "Test framework: #{@test_framework}", :success
+        case @test_framework
+        when :rspec
+          log_step "Test framework: RSpec detected", :success
+        when :minitest
+          log_step "Test framework: Minitest detected", :success
+        when :none
+          log_step "No test framework detected - tests will be skipped", :warning
+        end
       end
 
       # Validate that User model exists
@@ -117,14 +132,28 @@ module Nextgen
       private
 
       def rails_version_compatible?
-        Rails.version >= "6.0"
+        # Support Rails 6.0+ through Rails 8+
+        rails_version = Gem::Version.new(Rails.version)
+        minimum_version = Gem::Version.new("6.0.0")
+        rails_version >= minimum_version
       end
 
       def detect_test_framework
-        if File.exist?("spec/spec_helper.rb")
+        # Detect test framework with more comprehensive checks
+        if File.exist?("spec/spec_helper.rb") || File.exist?("spec/rails_helper.rb")
           :rspec
         elsif File.exist?("test/test_helper.rb")
           :minitest
+        elsif File.exist?("Gemfile")
+          # Fallback: check Gemfile for test framework gems
+          gemfile_content = File.read("Gemfile")
+          if gemfile_content.match?(/gem ['"]rspec-rails['"]/)
+            :rspec
+          elsif gemfile_content.match?(/gem ['"]minitest['"]/) || gemfile_content.match?(/rails/)
+            :minitest
+          else
+            :none
+          end
         else
           :none
         end
