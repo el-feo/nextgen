@@ -13,7 +13,7 @@ module TenantScoped
     validates :<%= @organization_name.underscore %>_id, presence: true
 
     # Apply default scope to filter by current organization
-    default_scope -> { 
+    default_scope -> {
       if TenantScoped.current_<%= @organization_name.underscore %>_id
         where(<%= @organization_name.underscore %>_id: TenantScoped.current_<%= @organization_name.underscore %>_id)
       else
@@ -46,7 +46,7 @@ module TenantScoped
       if Rails.env.production?
         Rails.logger.warn("WARNING: Bypassing tenant scoping in production. Caller: #{caller(1..3)}")
       end
-      
+
       unscoped { yield }
     end
 
@@ -63,7 +63,7 @@ module TenantScoped
     # Get current organization for this model
     def current_<%= @organization_name.underscore %>
       return nil unless TenantScoped.current_<%= @organization_name.underscore %>_id
-      
+
       @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.find(TenantScoped.current_<%= @organization_name.underscore %>_id)
     end
   end
@@ -71,8 +71,12 @@ module TenantScoped
   # Thread-safe storage for current organization context
   # This ensures tenant isolation across concurrent requests
   def self.current_<%= @organization_name.underscore %>_id
-    RequestStore.store[:current_<%= @organization_name.underscore %>_id] ||
+    if defined?(RequestStore)
+      RequestStore.store[:current_<%= @organization_name.underscore %>_id] ||
+        Thread.current[:current_<%= @organization_name.underscore %>_id]
+    else
       Thread.current[:current_<%= @organization_name.underscore %>_id]
+    end
   end
 
   def self.current_<%= @organization_name.underscore %>_id=(id)
@@ -80,9 +84,25 @@ module TenantScoped
     Thread.current[:current_<%= @organization_name.underscore %>_id] = id
   end
 
+  # Check if tenant scoping context is properly configured
+  def self.context_storage_available?
+    defined?(RequestStore) || Thread.current.respond_to?(:[])
+  end
+
+  # Clear all organization context (use with extreme caution)
+  def self.clear_context!
+    if Rails.env.production?
+      Rails.logger.warn("WARNING: Clearing tenant context in production. Caller: #{caller(1..3)}")
+    end
+
+    RequestStore.store[:current_<%= @organization_name.underscore %>_id] = nil if defined?(RequestStore)
+    Thread.current[:current_<%= @organization_name.underscore %>_id] = nil
+    @current_<%= @organization_name.underscore %> = nil
+  end
+
   def self.current_<%= @organization_name.underscore %>
     return nil unless current_<%= @organization_name.underscore %>_id
-    
+
     @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.unscoped.find(current_<%= @organization_name.underscore %>_id)
   end
 
@@ -95,9 +115,9 @@ module TenantScoped
   def self.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
     previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
     previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
-    
+
     self.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
-    
+
     yield
   ensure
     self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
@@ -108,10 +128,10 @@ module TenantScoped
   def self.without_<%= @organization_name.underscore %>
     previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
     previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
-    
+
     self.current_<%= @organization_name.underscore %>_id = nil
     @current_<%= @organization_name.underscore %> = nil
-    
+
     yield
   ensure
     self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
@@ -146,6 +166,11 @@ end
 
 # ApplicationController helper methods for setting organization context
 # Include this in your ApplicationController or a parent controller
+#
+# NOTE: For optimal thread safety in production, add the 'request_store' gem to your Gemfile:
+#   gem 'request_store'
+# The concern will work without it using Thread.current, but RequestStore provides
+# better request isolation in multi-threaded environments.
 module TenantScoped::ControllerHelpers
   extend ActiveSupport::Concern
 
@@ -162,15 +187,22 @@ module TenantScoped::ControllerHelpers
       return unless user_signed_in? # Adjust based on your authentication method
       return unless respond_to?(:current_user) && current_user
 
+      # Clear any previous context to prevent cross-request contamination
+      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
+
       # If user has only one organization, use it automatically
       user_<%= @organization_name.underscore.pluralize %> = current_user.<%= @organization_name.underscore.pluralize %>
-      
+
       if user_<%= @organization_name.underscore.pluralize %>.count == 1
         TenantScoped.current_<%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.first
       elsif params[:<%= @organization_name.underscore %>_id].present?
-        # Use organization from params if provided
-        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find(params[:<%= @organization_name.underscore %>_id])
-        TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+        # Use organization from params if provided and user has access
+        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find_by(id: params[:<%= @organization_name.underscore %>_id])
+        if <%= @organization_name.underscore %>
+          TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+        else
+          Rails.logger.warn("User #{current_user.id} attempted to access unauthorized organization #{params[:<%= @organization_name.underscore %>_id]}")
+        end
       elsif session[:current_<%= @organization_name.underscore %>_id].present?
         # Use organization from session if user has access
         <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find_by(id: session[:current_<%= @organization_name.underscore %>_id])
@@ -179,6 +211,16 @@ module TenantScoped::ControllerHelpers
 
       # Store in session for future requests
       session[:current_<%= @organization_name.underscore %>_id] = TenantScoped.current_<%= @organization_name.underscore %>_id
+
+      # Log context switches for debugging
+      if Rails.env.development? && TenantScoped.current_<%= @organization_name.underscore %>_id
+        Rails.logger.debug("Set tenant context to organization #{TenantScoped.current_<%= @organization_name.underscore %>_id}")
+      end
+    rescue => e
+      Rails.logger.error("Failed to set organization context: #{e.message}")
+      # Clear context on error to prevent data leakage
+      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
+      raise if Rails.env.development?
     end
 
     def current_<%= @organization_name.underscore %>
