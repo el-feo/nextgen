@@ -35,6 +35,7 @@ module Nextgen
 
         generate_organization_model
         generate_role_model
+        generate_membership_model
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -286,6 +287,44 @@ module Nextgen
 
         log_file_action :create, "db/migrate/create_#{@role_name.underscore.pluralize}.rb",
                        "Migration with enum validation and default role seed data"
+      end
+
+      # Generate the Membership model
+      def generate_membership_model
+        log_section "GENERATING MEMBERSHIP MODEL"
+        log_step "Creating #{@membership_name} model...", :info
+
+        model_file_path = "app/models/#{@membership_name.underscore}.rb"
+
+        if File.exist?(model_file_path) && !@force_overwrite
+          log_file_action :skip, model_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "membership.rb.erb",
+            model_file_path
+          )
+          log_file_action :create, model_file_path, "Join table model connecting Users, Organizations, and Roles"
+        end
+
+        # Generate migration unless skipped
+        unless @skip_migrations
+          generate_membership_migration
+        end
+
+        log_step "#{@membership_name} model created successfully", :success
+      end
+
+      # Generate the migration for memberships table
+      def generate_membership_migration
+        log_step "Creating migration for #{@membership_name.underscore.pluralize} table...", :info
+
+        migration_template(
+          "migration_templates/create_memberships.rb.erb",
+          "db/migrate/create_#{@membership_name.underscore.pluralize}.rb"
+        )
+
+        log_file_action :create, "db/migrate/create_#{@membership_name.underscore.pluralize}.rb",
+                       "Join table with foreign key constraints and composite indexes"
       end
 
       private
