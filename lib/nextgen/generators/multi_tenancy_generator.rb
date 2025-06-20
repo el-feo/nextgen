@@ -34,6 +34,7 @@ module Nextgen
         get_user_confirmation unless options[:force_overwrite]
 
         generate_organization_model
+        generate_role_model
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -247,6 +248,44 @@ module Nextgen
 
         log_file_action :create, "db/migrate/create_#{@organization_name.underscore.pluralize}.rb",
                        "Migration with proper indexes and constraints"
+      end
+
+      # Generate the Role model
+      def generate_role_model
+        log_section "GENERATING ROLE MODEL"
+        log_step "Creating #{@role_name} model...", :info
+
+        model_file_path = "app/models/#{@role_name.underscore}.rb"
+
+        if File.exist?(model_file_path) && !@force_overwrite
+          log_file_action :skip, model_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "role.rb.erb",
+            model_file_path
+          )
+          log_file_action :create, model_file_path, "Role model with enum validation for admin/member/owner types"
+        end
+
+        # Generate migration unless skipped
+        unless @skip_migrations
+          generate_role_migration
+        end
+
+        log_step "#{@role_name} model created successfully", :success
+      end
+
+      # Generate the migration for roles table
+      def generate_role_migration
+        log_step "Creating migration for #{@role_name.underscore.pluralize} table...", :info
+
+        migration_template(
+          "migration_templates/create_roles.rb.erb",
+          "db/migrate/create_#{@role_name.underscore.pluralize}.rb"
+        )
+
+        log_file_action :create, "db/migrate/create_#{@role_name.underscore.pluralize}.rb",
+                       "Migration with enum validation and default role seed data"
       end
 
       private

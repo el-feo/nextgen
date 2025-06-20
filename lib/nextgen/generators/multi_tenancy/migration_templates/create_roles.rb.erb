@@ -1,0 +1,45 @@
+<% migration_version = Rails::VERSION::MAJOR >= 5 ? "[#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}]" : "" -%>
+class Create<%= @role_name.pluralize %> < ActiveRecord::Migration<%= migration_version %>
+  def change
+    create_table :<%= @role_name.underscore.pluralize %> do |t|
+      t.string :name, null: false, limit: 50
+      t.string :role_type, null: false, limit: 20
+      t.text :description
+
+      t.timestamps null: false
+    end
+
+    # Indexes for performance
+    add_index :<%= @role_name.underscore.pluralize %>, :role_type
+    add_index :<%= @role_name.underscore.pluralize %>, [:name, :role_type], unique: true,
+              name: "index_<%= @role_name.underscore.pluralize %>_on_name_and_role_type"
+
+    # Add default roles
+    reversible do |dir|
+      dir.up do
+        # Create default role types
+        <%= @role_name %>.create!([
+          {
+            name: "Member",
+            role_type: "member",
+            description: "Standard member with basic access to organization resources"
+          },
+          {
+            name: "Administrator",
+            role_type: "admin",
+            description: "Administrator with elevated permissions to manage users and organization settings"
+          },
+          {
+            name: "Owner",
+            role_type: "owner",
+            description: "Organization owner with full control including ability to delete organization"
+          }
+        ])
+      end
+
+      dir.down do
+        # Remove default roles (will be handled by drop_table)
+      end
+    end
+  end
+end
