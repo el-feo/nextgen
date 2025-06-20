@@ -36,6 +36,7 @@ module Nextgen
         generate_organization_model
         generate_role_model
         generate_membership_model
+        add_user_model_associations
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -325,6 +326,80 @@ module Nextgen
 
         log_file_action :create, "db/migrate/create_#{@membership_name.underscore.pluralize}.rb",
                        "Join table with foreign key constraints and composite indexes"
+      end
+
+      # Add associations to the existing User model
+      def add_user_model_associations
+        log_section "ADDING USER MODEL ASSOCIATIONS"
+        log_step "Modifying User model to add multi-tenancy associations...", :info
+
+        user_model_path = "app/models/user.rb"
+
+        # Read the current User model content
+        user_content = File.read(user_model_path)
+
+        # Check if associations already exist
+        if user_content.include?("has_many :#{@membership_name.underscore.pluralize}") || user_content.include?("has_many :memberships")
+          log_file_action :skip, user_model_path, "Multi-tenancy associations already exist"
+          return
+        end
+
+        # Define the associations to add
+        associations = <<~ASSOCIATIONS.strip
+          # Multi-tenancy associations
+          has_many :#{@membership_name.underscore.pluralize}, dependent: :destroy, inverse_of: :user
+          has_many :#{@organization_name.underscore.pluralize}, through: :#{@membership_name.underscore.pluralize}
+          has_many :#{@role_name.underscore.pluralize}, through: :#{@membership_name.underscore.pluralize}
+
+          # Multi-tenancy methods
+          def #{@organization_name.underscore.pluralize}_for_role(role_type)
+            #{@organization_name.underscore.pluralize}.joins(:#{@membership_name.underscore.pluralize}).where(
+              #{@membership_name.underscore.pluralize}: { #{@role_name.underscore}_id: #{@role_name}.where(role_type: role_type) }
+            )
+          end
+
+          def role_in_#{@organization_name.underscore}(#{@organization_name.underscore})
+            #{@membership_name.underscore.pluralize}.find_by(#{@organization_name.underscore}: #{@organization_name.underscore})&.#{@role_name.underscore}
+          end
+
+          def member_of?(#{@organization_name.underscore})
+            #{@organization_name.underscore.pluralize}.include?(#{@organization_name.underscore})
+          end
+
+          def admin_of?(#{@organization_name.underscore})
+            role_in_#{@organization_name.underscore}(#{@organization_name.underscore})&.admin?
+          end
+
+          def owner_of?(#{@organization_name.underscore})
+            role_in_#{@organization_name.underscore}(#{@organization_name.underscore})&.owner?
+          end
+        ASSOCIATIONS
+
+        # Find the insertion point (after class declaration but before end)
+        if user_content.match(/class User < ApplicationRecord\s*\n/)
+          # Insert after the class declaration
+          updated_content = user_content.sub(
+            /(class User < ApplicationRecord\s*\n)/,
+            "\\1\n  #{associations}\n"
+          )
+        elsif user_content.match(/class User < ActiveRecord::Base\s*\n/)
+          # Handle older Rails versions
+          updated_content = user_content.sub(
+            /(class User < ActiveRecord::Base\s*\n)/,
+            "\\1\n  #{associations}\n"
+          )
+        else
+          log_step "Could not find User class declaration pattern", :error
+          say "Please manually add the following associations to your User model:", :yellow
+          say associations, :cyan
+          return
+        end
+
+        # Write the updated content back to the file
+        File.write(user_model_path, updated_content)
+
+        log_file_action :modify, user_model_path, "Added multi-tenancy associations and helper methods"
+        log_step "User model associations added successfully", :success
       end
 
       private
