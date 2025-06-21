@@ -41,6 +41,7 @@ module Nextgen
         generate_tenant_scoping_initializer
 
         scan_existing_models_for_tenant_integration
+        generate_tenant_migrations_for_existing_models
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -430,6 +431,7 @@ module Nextgen
         generate_system_scoped_interface unless @skip_concerns
 
         scan_existing_models_for_tenant_integration
+        generate_tenant_migrations_for_existing_models
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -727,6 +729,63 @@ module Nextgen
         # Store detailed results for next steps
         if models_needing_org_id.any?
           log_step "Next steps will include generating migrations for models needing #{@tenant_column}", :info
+        end
+      end
+
+      # Generate migrations to add organization_id to existing models
+      def generate_tenant_migrations_for_existing_models
+        return unless @models_needing_org_id&.any?
+
+        log_section "GENERATING TENANT MIGRATIONS FOR EXISTING MODELS"
+        log_step "Creating migrations to add #{@tenant_column} to existing models...", :info
+
+        @models_needing_org_id.each do |model_result|
+          generate_tenant_migration_for_model(model_result)
+        end
+
+        log_step "✓ Generated #{@models_needing_org_id.count} migration(s) for existing models", :success
+      end
+
+      # Generate a single migration for adding organization_id to a specific model
+      def generate_tenant_migration_for_model(model_result)
+        model_class = model_result[:model]
+        model_name = model_result[:name]
+        table_name = model_result[:table_name]
+
+        # Set up template variables
+        @target_table_name = table_name
+        @migration_version = get_rails_migration_version
+
+        # Generate migration name using proper string manipulation
+        tenant_column_camelized = @tenant_column.split('_').map(&:capitalize).join
+        model_name_pluralized = model_name + 's'  # Simple pluralization
+        migration_class_name = "Add#{tenant_column_camelized}To#{model_name_pluralized}"
+
+        log_step "Generating migration: #{migration_class_name}", :info
+
+        # Generate unique timestamp to avoid conflicts
+        @migration_counter ||= 0
+        @migration_counter += 1
+        adjusted_timestamp = (Time.current + @migration_counter.seconds).strftime("%Y%m%d%H%M%S")
+
+        migration_filename = "#{adjusted_timestamp}_#{migration_class_name.gsub(/([a-z\d])([A-Z])/, '\1_\2').downcase}.rb"
+        migration_path = "db/migrate/#{migration_filename}"
+
+        # Use Rails migration template
+        template "migration_templates/add_organization_id_to_table.rb.erb", migration_path
+
+        log_step "✓ Created migration: #{migration_path}", :success
+      end
+
+      # Get the appropriate Rails migration version
+      def get_rails_migration_version
+        if defined?(Rails) && Rails.respond_to?(:version)
+          # Extract major.minor version from Rails version
+          major, minor = Rails.version.split('.').first(2).map(&:to_i)
+          "#{major}.#{minor}"
+        else
+          # Fallback to a reasonable default
+          "7.0"
         end
       end
 
