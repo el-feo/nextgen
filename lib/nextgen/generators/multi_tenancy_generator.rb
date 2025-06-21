@@ -3,53 +3,51 @@
 require "rails/generators"
 require "rails/generators/base"
 
-module Nextgen
-  module Generators
-    class MultiTenancyGenerator < Rails::Generators::Base
-      desc "Add multi-tenancy support to your Rails application with organizations, roles, and tenant scoping"
+class MultiTenancyGenerator < Rails::Generators::Base
+  desc "Add multi-tenancy support to your Rails application with organizations, roles, and tenant scoping"
 
-      # Set the source root for templates
-      source_root File.expand_path("multi_tenancy", __dir__)
+  # Set the source root for templates
+  source_root File.expand_path("multi_tenancy", __dir__)
 
-      # Define class options for generator configuration
-      class_option :skip_tests, type: :boolean, default: false, desc: "Skip generating tests"
-      class_option :skip_concerns, type: :boolean, default: false, desc: "Skip generating tenant scoping concerns"
-      class_option :skip_migrations, type: :boolean, default: false, desc: "Skip generating migrations"
-      class_option :organization_name, type: :string, default: "Organization", desc: "Name for the organization model"
-      class_option :role_name, type: :string, default: "Role", desc: "Name for the role model"
-      class_option :membership_name, type: :string, default: "Membership", desc: "Name for the membership model"
-      class_option :tenant_column, type: :string, default: "organization_id", desc: "Column name for tenant foreign key"
-      class_option :force_overwrite, type: :boolean, default: false, desc: "Force overwrite existing files without prompting"
+  # Define class options for generator configuration
+  class_option :skip_tests, type: :boolean, default: false, desc: "Skip generating tests"
+  class_option :skip_concerns, type: :boolean, default: false, desc: "Skip generating tenant scoping concerns"
+  class_option :skip_migrations, type: :boolean, default: false, desc: "Skip generating migrations"
+  class_option :organization_name, type: :string, default: "Organization", desc: "Name for the organization model"
+  class_option :role_name, type: :string, default: "Role", desc: "Name for the role model"
+  class_option :membership_name, type: :string, default: "Membership", desc: "Name for the membership model"
+  class_option :tenant_column, type: :string, default: "organization_id", desc: "Column name for tenant foreign key"
+  class_option :force_overwrite, type: :boolean, default: false, desc: "Force overwrite existing files without prompting"
 
-      def self.exit_on_failure?
-        true
-      end
+  def self.exit_on_failure?
+    true
+  end
 
-      # Main generator execution flow
-      def execute
-        log_section "NEXTGEN MULTI-TENANCY GENERATOR"
-        parse_and_validate_options
-        check_compatibility
-        validate_user_model
-        get_user_confirmation unless options[:force_overwrite]
+  # Main generator execution flow
+  def execute
+    log_section "NEXTGEN MULTI-TENANCY GENERATOR"
+    parse_and_validate_options
+    check_compatibility
+    validate_user_model
+    get_user_confirmation unless options[:force_overwrite]
 
-        generate_organization_model
-        generate_role_model
-        generate_membership_model
-        add_user_model_associations
-        generate_tenant_scoped_concern unless @skip_concerns
-        generate_tenant_scoping_initializer
+    generate_organization_model
+    generate_role_model
+    generate_membership_model
+    add_user_model_associations
+    generate_tenant_scoped_concern unless @skip_concerns
+    generate_tenant_scoping_initializer
 
-        scan_existing_models_for_tenant_integration
-        generate_tenant_migrations_for_existing_models
-        include_tenant_scoped_concern_in_existing_models
-        handle_models_without_tables
-        update_existing_model_associations
-        generate_data_migration_guidance
-        offer_missing_table_migrations unless options[:skip_migrations]
+    scan_existing_models_for_tenant_integration
+    generate_tenant_migrations_for_existing_models
+    include_tenant_scoped_concern_in_existing_models
+    handle_models_without_tables
+    update_existing_model_associations
+    generate_data_migration_guidance
+    offer_missing_table_migrations unless options[:skip_migrations]
 
-        log_completion("Multi-tenancy setup completed successfully!")
-      end
+    log_completion("Multi-tenancy setup completed successfully!")
+  end
 
       private
 
@@ -1644,16 +1642,14 @@ module Nextgen
             end
           RUBY
         end.join("\n")
-      end
+    end
 
-      # Get the Rails version for migrations
-      def rails_version_for_migration
-        if defined?(Rails) && Rails.respond_to?(:version)
-          Rails.version
-        else
-          "7.0" # Default fallback
-        end
+    # Get the Rails version for migrations
+    def rails_version_for_migration
+      if defined?(Rails) && Rails.respond_to?(:version)
+        Rails.version
+      else
+        "7.0" # Default fallback
       end
     end
-  end
 end
