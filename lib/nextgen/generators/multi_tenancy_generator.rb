@@ -424,6 +424,51 @@ module Nextgen
         log_step "TenantScoped concern created successfully", :success
         log_step "Include 'TenantScoped' in models that need organization scoping", :info
         log_step "Include 'TenantScoped::ControllerHelpers' in ApplicationController", :info
+
+        generate_system_scoped_interface unless @skip_concerns
+      end
+
+      # Generate the SystemScoped interface for models that should not be tenant-scoped
+      def generate_system_scoped_interface
+        log_section "GENERATING SYSTEM SCOPED INTERFACE"
+        log_step "Creating SystemScoped interface for global models...", :info
+
+        interface_file_path = "app/models/concerns/system_scoped.rb"
+
+        if File.exist?(interface_file_path) && !@force_overwrite
+          log_file_action :skip, interface_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "system_scoped.rb.erb",
+            interface_file_path
+          )
+          log_file_action :create, interface_file_path, "Interface for models that should not be tenant-scoped"
+        end
+
+        log_step "SystemScoped interface created successfully", :success
+        log_step "Include 'SystemScoped' in models that should be global (not tenant-specific)", :info
+        log_step "Examples: SystemConfiguration, AuditLog, Country, DelayedJob", :info
+
+        generate_tenant_scoping_configuration
+      end
+
+      # Generate configuration file for tenant scoping
+      def generate_tenant_scoping_configuration
+        log_step "Creating tenant scoping configuration...", :info
+
+        config_file_path = "config/initializers/tenant_scoping_configuration.rb"
+
+        if File.exist?(config_file_path) && !@force_overwrite
+          log_file_action :skip, config_file_path, "Use --force-overwrite to replace"
+        else
+          template(
+            "tenant_scoping_configuration.rb.erb",
+            config_file_path
+          )
+          log_file_action :create, config_file_path, "Configuration for customizing tenant scoping behavior"
+        end
+
+        log_step "Tenant scoping configuration created successfully", :success
       end
 
       private

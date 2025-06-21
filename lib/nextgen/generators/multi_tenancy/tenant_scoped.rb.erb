@@ -16,6 +16,10 @@ module TenantScoped
   class UnscopedQueryError < TenantScopingError; end
 
   included do
+    # VALIDATION: Ensure this model is compatible with tenant scoping
+    # This validation runs when the concern is included in a model class
+    validate_tenant_scoping_compatibility!
+
     # Add belongs_to association to the organization
     belongs_to :<%= @organization_name.underscore %>, optional: false
 
@@ -82,6 +86,11 @@ module TenantScoped
   #
   # 5. Read-only bypass for reports:
   #    MyModel.without_tenant_scoping_readonly { MyModel.joins(:other_model).count }
+  #
+  # 6. Validation and introspection helper methods:
+  #    MyModel.tenant_scoping_active? # => true/false
+  #    MyModel.current_<%= @organization_name.underscore %> # => returns the current organization
+  #    MyModel.validate_tenant_scoping_compatibility! # => validates the model's compatibility with tenant scoping
   #
   module ClassMethods
     # Temporarily bypass tenant scoping for admin operations
@@ -262,6 +271,44 @@ module TenantScoped
 
       @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.find(TenantScoped.current_<%= @organization_name.underscore %>_id)
     end
+
+    # Check if this model is tenant-scoped (always true for models that include TenantScoped)
+    def tenant_scoped?
+      true
+    end
+
+    # Check if this model is system-scoped (always false for models that include TenantScoped)
+    def system_scoped?
+      false
+    end
+
+    # Get the scoping type for this model
+    def scoping_type
+      :tenant
+    end
+
+    # Validate that this model is compatible with tenant scoping
+    def validate_tenant_scoping_compatibility!
+      TenantScoped.validate_tenant_scoping_compatibility!(self)
+    end
+
+    # Check if this model has the required organization column
+    def has_organization_column?
+      return false unless respond_to?(:column_names)
+      column_names.include?('<%= @organization_name.underscore %>_id')
+    end
+
+    # Get all records across all organizations (admin bypass)
+    def all_organizations_unscoped
+      Rails.logger.warn("[TENANT_WARNING] Using all_organizations_unscoped on #{self.name}")
+      unscoped
+    end
+
+    # Get count of records across all organizations (admin reporting)
+    def total_count_all_organizations
+      Rails.logger.info("[TENANT_REPORTING] Getting total count across all organizations for #{self.name}")
+      unscoped.count
+    end
   end
 
   # Thread-safe storage for current organization context
@@ -359,563 +406,228 @@ module TenantScoped
     throw :abort
   end
 
-  # Module methods for bypass control and monitoring
-  module_function
+  # Validation method to ensure model compatibility with tenant scoping
+  # This is called when TenantScoped is included in a model class
+  def self.validate_tenant_scoping_compatibility!(model_class = self)
+    model_name = model_class.name
 
-  # Check if bypass operations are enabled in current environment
-  def bypass_enabled?
-    BYPASS_ENABLED_ENVIRONMENTS.include?(Rails.env)
-  end
+    # Skip validation if SystemScoped::Configuration is not available
+    # (happens when SystemScoped hasn't been generated yet)
+    return true unless defined?(SystemScoped::Configuration)
 
-  # Global flag to temporarily disable all bypass operations (emergency stop)
-  def disable_all_bypasses!
-    @bypasses_disabled = true
-    Rails.logger.error("[EMERGENCY] All tenant scoping bypasses have been globally disabled")
-  end
+    begin
+      SystemScoped::Configuration.validate_tenant_scoping_compatibility!(model_class)
+    rescue SystemScoped::Configuration::IncompatibleModelError => e
+      Rails.logger.error("[TENANT_ERROR] #{e.message}")
+      raise TenantScopingError, e.message
+    rescue SystemScoped::Configuration::MissingColumnError => e
+      Rails.logger.error("[TENANT_ERROR] #{e.message}")
 
-  def enable_bypasses!
-    @bypasses_disabled = false
-    Rails.logger.warn("[SECURITY] Tenant scoping bypasses have been re-enabled")
-  end
+      # Provide helpful guidance
+      guidance = <<~GUIDANCE
 
-  def bypasses_disabled?
-    @bypasses_disabled || false
-  end
+        To fix this issue, you have several options:
 
-  # Audit trail helpers
-  def log_bypass_operation(model_name, operation_type, details = {})
-    log_data = {
-      model: model_name,
-      operation: operation_type,
-      timestamp: Time.current,
-      environment: Rails.env,
-      caller: caller(2..4),
-      **details
-    }
+        1. Add the missing column with a migration:
+           rails generate migration Add<%= @organization_name %>ToYourModel <%= @organization_name.underscore %>:references
+           rails db:migrate
 
-    Rails.logger.public_send(BYPASS_AUDIT_LOG_LEVEL, "[TENANT_AUDIT] #{log_data.to_json}")
-  end
+        2. If this model should be global (not tenant-specific), use SystemScoped instead:
+           class #{model_name} < ApplicationRecord
+             include SystemScoped  # Remove TenantScoped
+           end
 
-  # Query monitoring for unscoped query detection in production
-  # This system monitors SQL queries to detect and prevent unscoped queries that could lead to data leakage
+        3. If this is a system model, add it to the exclusion list in an initializer:
+           SystemScoped::Configuration.exclude_model('#{model_name}')
+      GUIDANCE
 
-  # Initialize query monitoring (call this in an initializer)
-  def self.setup_query_monitoring!
-    return unless Rails.env.production?
-    return if @query_monitoring_setup
-
-    # Track models that should have tenant scoping
-    @tenant_scoped_models = Set.new
-
-    # Monitor SQL queries for unscoped operations
-    ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
-      next unless should_monitor_query?(event)
-
-      sql = event.payload[:sql]
-      name = event.payload[:name]
-      connection = event.payload[:connection]
-
-      detect_unscoped_query(sql, name, connection, event)
+      raise TenantScopingError, "#{e.message}#{guidance}"
     end
-
-    @query_monitoring_setup = true
-    Rails.logger.info("[TENANT_MONITOR] Query monitoring for tenant scoping enabled")
-  end
-
-  # Register a model as requiring tenant scoping
-  def self.register_tenant_scoped_model(model_class)
-    @tenant_scoped_models ||= Set.new
-    @tenant_scoped_models.add(model_class.table_name)
-    Rails.logger.debug("[TENANT_MONITOR] Registered #{model_class.name} for tenant scoping monitoring")
-  end
-
-  # Check if we should monitor this query
-  def self.should_monitor_query?(event)
-    # Skip non-production environments unless explicitly enabled
-    return false unless Rails.env.production? || ENV['TENANT_SCOPING_MONITOR'] == 'true'
-
-    # Skip certain query types that don't need monitoring
-    name = event.payload[:name]
-    sql = event.payload[:sql]
-
-    # Skip schema queries, migrations, and Rails internal queries
-    return false if name&.match?(/SCHEMA|Migration|ActiveRecord::|Rails::/)
-    return false if sql&.match?(/information_schema|pg_|sqlite_|PRAGMA|SHOW/)
-
-    # Skip queries during bypasses (thread-local flag)
-    return false if Thread.current[:tenant_scoping_bypass_active]
 
     true
   end
 
-  # Detect potentially unscoped queries
-  def self.detect_unscoped_query(sql, name, connection, event)
-    return unless @tenant_scoped_models&.any?
+  # Module method to validate tenant scoping compatibility
+  def self.included(base)
+    super
 
-    # Check if this query touches tenant-scoped tables without proper filtering
-    @tenant_scoped_models.each do |table_name|
-      next unless sql.match?(/FROM\s+["`]?#{table_name}["`]?|JOIN\s+["`]?#{table_name}["`]?/i)
-
-      # Look for organization_id filtering in the WHERE clause
-      unless has_organization_filter?(sql, table_name)
-        handle_unscoped_query_violation(sql, name, table_name, event)
+    # Perform validation when the concern is included
+    # Delay validation until after initialization to ensure all dependencies are loaded
+    if defined?(Rails) && Rails.application
+      Rails.application.config.after_initialize do
+        begin
+          validate_tenant_scoping_compatibility!(base)
+        rescue TenantScopingError => e
+          # Re-raise with more context
+          raise TenantScopingError,
+            "Failed to include TenantScoped in #{base.name}: #{e.message}"
+        end
       end
+    else
+      # Immediate validation if not in Rails context
+      validate_tenant_scoping_compatibility!(base)
     end
   end
 
-  # Check if SQL has proper organization filtering
-  def self.has_organization_filter?(sql, table_name)
-    # Look for organization_id in WHERE clause (various formats)
-    patterns = [
-      /WHERE.*#{table_name}["`]?\.["`]?<%= @organization_name.underscore %>_id\s*[=]/i,
-      /WHERE.*["`]?<%= @organization_name.underscore %>_id["`]?\s*[=]/i,
-      /AND.*#{table_name}["`]?\.["`]?<%= @organization_name.underscore %>_id\s*[=]/i,
-      /AND.*["`]?<%= @organization_name.underscore %>_id["`]?\s*[=]/i
-    ]
+  # Error classes for better error handling
+  class ModelIncompatibilityError < TenantScopingError; end
+  class MissingColumnError < TenantScopingError; end
 
-    patterns.any? { |pattern| sql.match?(pattern) }
+  # Helper methods for introspection and configuration
+
+  # Check if a model class is compatible with tenant scoping
+  def self.model_compatible?(model_class)
+    return false unless model_class.respond_to?(:column_names)
+    return false if defined?(SystemScoped::Configuration) &&
+                   SystemScoped::Configuration.excluded_model?(model_class)
+    return false if model_class.respond_to?(:system_scoped?) && model_class.system_scoped?
+
+    model_class.column_names.include?('<%= @organization_name.underscore %>_id')
   end
 
-  # Handle unscoped query violations
-  def self.handle_unscoped_query_violation(sql, name, table_name, event)
-    caller_info = caller(6..10)&.join("\n") || "Unknown caller"
+  # Get all models that include TenantScoped
+  def self.tenant_scoped_models
+    @tenant_scoped_models ||= []
+  end
 
-    violation_data = {
-      sql: sql,
-      query_name: name,
-      table: table_name,
-      timestamp: Time.current,
-      environment: Rails.env,
-      caller: caller_info,
-      current_org_id: current_<%= @organization_name.underscore %>_id,
-      connection_id: event.payload[:connection]&.object_id
+  # Register a model as tenant-scoped
+  def self.register_tenant_scoped_model(model_class)
+    tenant_scoped_models << model_class unless tenant_scoped_models.include?(model_class)
+  end
+
+  # Check if a model class includes TenantScoped
+  def self.model_tenant_scoped?(model_class)
+    tenant_scoped_models.include?(model_class) ||
+      (model_class.respond_to?(:tenant_scoped?) && model_class.tenant_scoped?)
+  end
+
+  # Get summary of scoping configuration
+  def self.scoping_summary
+    summary = {
+      tenant_scoped_models: tenant_scoped_models.map(&:name),
+      system_scoped_models: [],
+      excluded_models: [],
+      total_models: 0
     }
 
-    # Log the violation
-    Rails.logger.error("[TENANT_VIOLATION] Unscoped query detected: #{violation_data.to_json}")
-
-    # In production, this could be configured to:
-    # 1. Just log (current behavior)
-    # 2. Send alerts to monitoring systems
-    # 3. Raise an exception (strict mode)
-
-    if ENV['TENANT_SCOPING_STRICT'] == 'true'
-      raise UnscopedQueryError, "Unscoped query detected on table '#{table_name}': #{sql.truncate(200)}"
+    if defined?(SystemScoped::Configuration)
+      summary[:system_scoped_models] = SystemScoped::Configuration.system_scoped_models.map(&:name)
+      summary[:excluded_models] = SystemScoped::Configuration.excluded_models
     end
 
-    # Optional: Send to external monitoring (uncomment and configure as needed)
-    # send_unscoped_query_alert(violation_data)
+    if defined?(ApplicationRecord)
+      summary[:total_models] = ApplicationRecord.descendants.count
+    end
+
+    summary
   end
 
-  # Send alerts to external monitoring systems (implement as needed)
-  # def self.send_unscoped_query_alert(violation_data)
-  #   # Example: Send to error tracking service
-  #   # Bugsnag.notify(UnscopedQueryError.new("Unscoped query detected"), violation_data)
-  #   #
-  #   # Example: Send to metrics service
-  #   # StatsD.increment("tenant_scoping.unscoped_query", tags: { table: violation_data[:table] })
-  # end
+  # Print scoping configuration (useful for debugging)
+  def self.print_scoping_summary
+    summary = scoping_summary
 
-  # Enable/disable query monitoring
-  def self.enable_query_monitoring!
-    @query_monitoring_disabled = false
-    Rails.logger.info("[TENANT_MONITOR] Query monitoring enabled")
+    puts "\n" + "="*60
+    puts "  TENANT SCOPING SUMMARY"
+    puts "="*60
+    puts "Total Models: #{summary[:total_models]}"
+    puts "Tenant-Scoped Models (#{summary[:tenant_scoped_models].count}):"
+    summary[:tenant_scoped_models].each { |name| puts "  • #{name}" }
+    puts "\nSystem-Scoped Models (#{summary[:system_scoped_models].count}):"
+    summary[:system_scoped_models].each { |name| puts "  • #{name}" }
+    puts "\nExcluded Models (#{summary[:excluded_models].count}):"
+    summary[:excluded_models].each { |name| puts "  • #{name}" }
+    puts "="*60
   end
 
-  def self.disable_query_monitoring!
-    @query_monitoring_disabled = true
-    Rails.logger.warn("[TENANT_MONITOR] Query monitoring disabled")
-  end
-
-  def self.query_monitoring_disabled?
-    @query_monitoring_disabled || false
-  end
 end
 
-# ApplicationController helper methods for setting organization context
-# Include this in your ApplicationController or a parent controller
+# Additional documentation and error handling examples for SystemScoped models
 #
-# NOTE: For optimal thread safety in production, add the 'request_store' gem to your Gemfile:
-#   gem 'request_store'
-# The concern will work without it using Thread.current, but RequestStore provides
-# better request isolation in multi-threaded environments.
-module TenantScoped::ControllerHelpers
-  extend ActiveSupport::Concern
-
-  included do
-    # Automatically set organization context from current user
-    before_action :set_current_<%= @organization_name.underscore %>
-
-    # Helper method available in views
-    helper_method :current_<%= @organization_name.underscore %>
-
-    private
-
-    def set_current_<%= @organization_name.underscore %>
-      return unless user_signed_in? # Adjust based on your authentication method
-      return unless respond_to?(:current_user) && current_user
-
-      # Clear any previous context to prevent cross-request contamination
-      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
-
-      # If user has only one organization, use it automatically
-      user_<%= @organization_name.underscore.pluralize %> = current_user.<%= @organization_name.underscore.pluralize %>
-
-      if user_<%= @organization_name.underscore.pluralize %>.count == 1
-        TenantScoped.current_<%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.first
-      elsif params[:<%= @organization_name.underscore %>_id].present?
-        # Use organization from params if provided and user has access
-        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find_by(id: params[:<%= @organization_name.underscore %>_id])
-        if <%= @organization_name.underscore %>
-          TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
-        else
-          Rails.logger.warn("User #{current_user.id} attempted to access unauthorized organization #{params[:<%= @organization_name.underscore %>_id]}")
-        end
-      elsif session[:current_<%= @organization_name.underscore %>_id].present?
-        # Use organization from session if user has access
-        <%= @organization_name.underscore %> = user_<%= @organization_name.underscore.pluralize %>.find_by(id: session[:current_<%= @organization_name.underscore %>_id])
-        TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %> if <%= @organization_name.underscore %>
-      end
-
-      # Store in session for future requests
-      session[:current_<%= @organization_name.underscore %>_id] = TenantScoped.current_<%= @organization_name.underscore %>_id
-
-      # Log context switches for debugging
-      if Rails.env.development? && TenantScoped.current_<%= @organization_name.underscore %>_id
-        Rails.logger.debug("Set tenant context to organization #{TenantScoped.current_<%= @organization_name.underscore %>_id}")
-      end
-    rescue => e
-      Rails.logger.error("Failed to set organization context: #{e.message}")
-      # Clear context on error to prevent data leakage
-      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
-      raise if Rails.env.development?
-    end
-
-    def current_<%= @organization_name.underscore %>
-      TenantScoped.current_<%= @organization_name.underscore %>
-    end
-
-    def require_<%= @organization_name.underscore %>
-      unless TenantScoped.current_<%= @organization_name.underscore %>
-        redirect_to <%= @organization_name.underscore.pluralize %>_path, alert: "Please select an <%= @organization_name.underscore %> to continue."
-      end
-    end
-
-    # Switch organization context (useful for organization selection)
-    def switch_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
-      return unless current_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
-
-      TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
-      session[:current_<%= @organization_name.underscore %>_id] = <%= @organization_name.underscore %>.id
-    end
-
-    # Explicit organization setter with authorization checking
-    # Use this for programmatic organization switching (e.g., organization selection form)
-    def set_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user: nil)
-      user = authorized_user || current_user
-      raise TenantScoped::TenantScopingError, "No user provided for organization context setting" unless user
-
-      <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
-        <%= @organization_name.underscore %>_id_or_object :
-        user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
-
-      # Verify user has access to this organization
-      unless user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
-        raise TenantScoped::CrossTenantAccessError,
-          "User #{user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
-      end
-
-      TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
-      session[:current_<%= @organization_name.underscore %>_id] = <%= @organization_name.underscore %>.id if respond_to?(:session)
-
-      Rails.logger.info("Organization context set to #{<%= @organization_name.underscore %>.id} for user #{user.id}")
-      <%= @organization_name.underscore %>
-    end
-
-    # Clear organization context (useful for logout or context reset)
-    def clear_<%= @organization_name.underscore %>_context!
-      TenantScoped.current_<%= @organization_name.underscore %>_id = nil
-      session[:current_<%= @organization_name.underscore %>_id] = nil if respond_to?(:session)
-      Rails.logger.debug("Organization context cleared")
-    end
-
-    # Temporarily execute a block with a different organization context
-    # Useful for cross-tenant operations that the current user is authorized for
-    def with_<%= @organization_name.underscore %>_context(<%= @organization_name.underscore %>_id_or_object, authorized_user: nil, &block)
-      user = authorized_user || current_user
-      raise TenantScoped::TenantScopingError, "No user provided for temporary organization context" unless user
-
-      <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
-        <%= @organization_name.underscore %>_id_or_object :
-        user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
-
-      # Verify user has access to this organization
-      unless user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
-        raise TenantScoped::CrossTenantAccessError,
-          "User #{user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
-      end
-
-      TenantScoped.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>, &block)
-    end
-
-    # Validate current organization context
-    def validate_<%= @organization_name.underscore %>_context!(user: nil)
-      user ||= current_user
-      current_<%= @organization_name.underscore %>_obj = TenantScoped.current_<%= @organization_name.underscore %>
-
-      unless current_<%= @organization_name.underscore %>_obj
-        raise TenantScoped::TenantScopingError, "No organization context set"
-      end
-
-      if user && !user.<%= @organization_name.underscore.pluralize %>.include?(current_<%= @organization_name.underscore %>_obj)
-        raise TenantScoped::CrossTenantAccessError,
-          "User #{user.id} does not have access to current organization #{current_<%= @organization_name.underscore %>_obj.id}"
-      end
-
-      current_<%= @organization_name.underscore %>_obj
-    end
-  end
-end
-
-# Service and background job helper methods for organization context
-# Include this in your service objects and background jobs
+# SYSTEM MODELS THAT SHOULD USE SystemScoped INSTEAD OF TenantScoped:
 #
-# USAGE EXAMPLES:
+# 1. Configuration Models:
+#    class SystemConfiguration < ApplicationRecord
+#      include SystemScoped
+#      # Global application settings that apply to all tenants
+#    end
 #
-# class ReportGenerationService
-#   include TenantScoped::ServiceHelpers
+# 2. Audit/Logging Models:
+#    class AuditLog < ApplicationRecord
+#      include SystemScoped
+#      # System-wide audit trail that spans all tenants
+#    end
 #
-#   def initialize(user:)
-#     @user = user
-#     ensure_organization_context!(@user)
+# 3. Reference Data Models:
+#    class Country < ApplicationRecord
+#      include SystemScoped
+#      # Global reference data used by all tenants
+#    end
+#
+# 4. Background Job Models:
+#    class DelayedJob < ApplicationRecord
+#      include SystemScoped
+#      # Job queue that manages work for all tenants
+#    end
+#
+# 5. System User Models:
+#    class AdminUser < ApplicationRecord
+#      include SystemScoped
+#      # System administrators who can access multiple tenants
+#    end
+#
+# CONFIGURATION EXAMPLES:
+#
+# In config/initializers/tenant_scoping.rb:
+#
+#   # Exclude specific models from tenant scoping
+#   SystemScoped::Configuration.excluded_models = [
+#     'AuditLog',
+#     'SystemConfiguration',
+#     'DelayedJob',
+#     'AdminUser'
+#   ]
+#
+#   # Add individual models to exclusion list
+#   SystemScoped::Configuration.exclude_model('CustomSystemModel')
+#
+#   # Check if model is compatible with tenant scoping
+#   if TenantScoped.model_compatible?(YourModel)
+#     puts "YourModel can use TenantScoped"
+#   else
+#     puts "YourModel should use SystemScoped"
 #   end
 #
-#   def generate_report
-#     # All queries here will be automatically scoped to the current organization
-#     User.count # Only counts users in current organization
-#   end
+# ERROR HANDLING EXAMPLES:
+#
+# # Model missing organization_id column:
+# class BlogPost < ApplicationRecord
+#   include TenantScoped  # ERROR: No organization_id column
 # end
+# # Fix: Add migration or use SystemScoped
 #
-# class BackgroundReportJob < ApplicationJob
-#   include TenantScoped::ServiceHelpers
-#
-#   def perform(user_id, organization_id)
-#     user = User.unscoped.find(user_id)
-#     execute_with_organization_context(organization_id, authorized_user: user) do
-#       # Job logic here - all queries scoped to organization
-#       generate_and_email_report
-#     end
-#   end
+# # Model with conflicting scoping:
+# class Settings < ApplicationRecord
+#   include SystemScoped
+#   include TenantScoped  # ERROR: Cannot use both
 # end
-module TenantScoped::ServiceHelpers
-  extend ActiveSupport::Concern
-
-  # Set organization context for service operations
-  # Call this at the beginning of service methods that need tenant scoping
-  def set_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user:)
-    raise TenantScoped::TenantScopingError, "No user provided for service organization context" unless authorized_user
-
-    <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
-      <%= @organization_name.underscore %>_id_or_object :
-      authorized_user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
-
-    # Verify user has access to this organization
-    unless authorized_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
-      raise TenantScoped::CrossTenantAccessError,
-        "User #{authorized_user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
-    end
-
-    TenantScoped.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
-    Rails.logger.info("Service organization context set to #{<%= @organization_name.underscore %>.id} for user #{authorized_user.id}")
-    <%= @organization_name.underscore %>
-  end
-
-  # Ensure organization context is set, raise error if not
-  # Use this for services that require organization context
-  def ensure_<%= @organization_name.underscore %>_context!(user: nil)
-    current_<%= @organization_name.underscore %>_obj = TenantScoped.current_<%= @organization_name.underscore %>
-
-    unless current_<%= @organization_name.underscore %>_obj
-      raise TenantScoped::TenantScopingError, "Organization context required but not set"
-    end
-
-    if user && !user.<%= @organization_name.underscore.pluralize %>.include?(current_<%= @organization_name.underscore %>_obj)
-      raise TenantScoped::CrossTenantAccessError,
-        "User #{user.id} does not have access to current organization #{current_<%= @organization_name.underscore %>_obj.id}"
-    end
-
-    current_<%= @organization_name.underscore %>_obj
-  end
-
-  # Execute a block with organization context set
-  # Useful for background jobs and service methods
-  def execute_with_<%= @organization_name.underscore %>_context(<%= @organization_name.underscore %>_id_or_object, authorized_user:, &block)
-    raise TenantScoped::TenantScopingError, "No block provided" unless block_given?
-
-    <%= @organization_name.underscore %> = <%= @organization_name.underscore %>_id_or_object.is_a?(<%= @organization_name %>) ?
-      <%= @organization_name.underscore %>_id_or_object :
-      authorized_user.<%= @organization_name.underscore.pluralize %>.find(<%= @organization_name.underscore %>_id_or_object)
-
-    # Verify user has access to this organization
-    unless authorized_user.<%= @organization_name.underscore.pluralize %>.include?(<%= @organization_name.underscore %>)
-      raise TenantScoped::CrossTenantAccessError,
-        "User #{authorized_user.id} does not have access to organization #{<%= @organization_name.underscore %>.id}"
-    end
-
-    TenantScoped.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>, &block)
-  end
-
-  # Clear organization context (useful for cleanup)
-  def clear_service_<%= @organization_name.underscore %>_context!
-    TenantScoped.current_<%= @organization_name.underscore %>_id = nil
-    Rails.logger.debug("Service organization context cleared")
-  end
-
-  # Get current organization for service operations
-  def current_service_<%= @organization_name.underscore %>
-    TenantScoped.current_<%= @organization_name.underscore %>
-  end
-
-  # Switch organization context for cross-tenant service operations
-  # Use with extreme caution - ensure proper authorization
-  def switch_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user:, admin_check: nil)
-    # Extra authorization check for cross-tenant operations
-    if admin_check && !admin_check.call
-      raise TenantScoped::AdminAuthorizationError, "Admin authorization required for cross-tenant service operation"
-    end
-
-    set_service_<%= @organization_name.underscore %>_context!(<%= @organization_name.underscore %>_id_or_object, authorized_user: authorized_user)
-  end
-end
-
-# SETUP INSTRUCTIONS FOR QUERY MONITORING
+# # Fix: Choose one scoping type
 #
-# Add this to your Rails application initializer (config/initializers/tenant_scoping.rb):
-#
-#   if Rails.env.production?
-#     TenantScoped.setup_query_monitoring!
-#   end
-#
-# ENVIRONMENT VARIABLES:
-#
-# TENANT_SCOPING_MONITOR=true    - Enable monitoring in non-production environments
-# TENANT_SCOPING_STRICT=true     - Raise exceptions instead of just logging violations
-#
-# PRODUCTION DEPLOYMENT CHECKLIST:
-#
-# 1. Set up query monitoring in initializer
-# 2. Configure error tracking (Bugsnag, Sentry, etc.) to capture UnscopedQueryError
-# 3. Set up metrics/alerting for tenant scoping violations
-# 4. Monitor logs for [TENANT_VIOLATION] entries
-# 5. Consider enabling TENANT_SCOPING_STRICT after thorough testing
-#
-# EXAMPLE USAGE:
-#
-# # Safe bypass for admin operations
-# User.with_admin_bypass(
-#   admin_check: -> { current_user&.admin? },
-#   reason: "Generating cross-tenant report"
-# ) do
-#   User.joins(:memberships).group(:organization_id).count
+# # Model in exclusion list:
+# SystemScoped::Configuration.exclude_model('Product')
+# class Product < ApplicationRecord
+#   include TenantScoped  # ERROR: Model is excluded
 # end
+# # Fix: Use SystemScoped or remove from exclusion list
 #
-# # Data migration example
-# User.without_tenant_scoping do
-#   User.where(organization_id: nil).update_all(organization_id: default_org.id)
-# end
+# DEBUGGING TOOLS:
 #
-# # Multi-tenant operations
-# User.for_each_organization(admin_check: -> { current_user&.super_admin? }) do |org|
-#   # Process each organization's data safely
-#   puts "Processing #{org.name}: #{User.count} users"
-# end
+# # Print scoping summary in Rails console
+# TenantScoped.print_scoping_summary
 #
-# CONTROLLER USAGE EXAMPLES:
+# # Check specific model compatibility
+# TenantScoped.model_compatible?(YourModel)
+# TenantScoped.model_tenant_scoped?(YourModel)
 #
-# # In ApplicationController:
-# class ApplicationController < ActionController::Base
-#   include TenantScoped::ControllerHelpers
-#   # Automatic organization context setting via before_action
-# end
+# # Get all tenant-scoped models
+# TenantScoped.tenant_scoped_models.map(&:name)
 #
-# # Manual organization context setting:
-# def switch_organization
-#   org = set_organization_context!(params[:organization_id])
-#   redirect_to dashboard_path, notice: "Switched to #{org.name}"
-# rescue TenantScoped::CrossTenantAccessError => e
-#   redirect_to organizations_path, alert: e.message
-# end
-#
-# # Temporary cross-tenant operations:
-# def admin_report
-#   with_organization_context(params[:target_org_id]) do
-#     @users = User.all # Scoped to target organization
-#     @projects = Project.all # Also scoped to target organization
-#   end
-# end
-#
-# # Context validation:
-# before_action :validate_organization_context!
-#
-# SERVICE USAGE EXAMPLES:
-#
-# # Service object with organization context:
-# class ReportGenerationService
-#   include TenantScoped::ServiceHelpers
-#
-#   def initialize(user:, organization_id: nil)
-#     @user = user
-#     if organization_id
-#       set_service_organization_context!(organization_id, authorized_user: @user)
-#     else
-#       ensure_organization_context!(user: @user)
-#     end
-#   end
-#
-#   def generate_report
-#     # All queries automatically scoped to current organization
-#     {
-#       users_count: User.count,
-#       projects_count: Project.count,
-#       organization: current_service_organization.name
-#     }
-#   end
-# end
-#
-# # Background job with organization context:
-# class WeeklyReportJob < ApplicationJob
-#   include TenantScoped::ServiceHelpers
-#
-#   def perform(user_id, organization_id)
-#     user = User.unscoped.find(user_id)
-#     execute_with_organization_context(organization_id, authorized_user: user) do
-#       # All database operations here are scoped to the organization
-#       report_data = generate_weekly_report
-#       ReportMailer.weekly_report(user, report_data).deliver_now
-#     end
-#   rescue TenantScoped::CrossTenantAccessError => e
-#     Rails.logger.error("Job authorization failed: #{e.message}")
-#     raise
-#   end
-# end
-#
-# # Cross-tenant admin service:
-# class CrossTenantAuditService
-#   include TenantScoped::ServiceHelpers
-#
-#   def perform_audit(admin_user:, target_organization_ids:)
-#     ensure_admin_authorized!(admin_user)
-#
-#     target_organization_ids.each do |org_id|
-#       switch_service_organization_context!(
-#         org_id,
-#         authorized_user: admin_user,
-#         admin_check: -> { admin_user.super_admin? }
-#       )
-#
-#       audit_organization_data
-#     end
-#   ensure
-#     clear_service_organization_context!
-#   end
-# end

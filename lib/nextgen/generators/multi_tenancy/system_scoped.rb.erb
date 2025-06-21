@@ -1,0 +1,317 @@
+# frozen_string_literal: true
+
+# SystemScoped interface for models that should NOT be tenant-scoped
+#
+# Include this module in models that are global/system-wide and should not
+# be automatically scoped to organizations. This acts as a marker interface
+# to prevent accidental inclusion of TenantScoped in inappropriate models.
+#
+# EXAMPLES OF SYSTEM MODELS:
+#
+# Configuration models:
+#   class SystemConfiguration < ApplicationRecord
+#     include SystemScoped
+#   end
+#
+# Audit/logging models:
+#   class AuditLog < ApplicationRecord
+#     include SystemScoped
+#   end
+#
+# Reference data models:
+#   class Country < ApplicationRecord
+#     include SystemScoped
+#   end
+#
+# Background job models:
+#   class DelayedJob < ApplicationRecord
+#     include SystemScoped
+#   end
+#
+# System user models:
+#   class AdminUser < ApplicationRecord
+#     include SystemScoped
+#   end
+#
+# USAGE GUIDELINES:
+#
+# Use SystemScoped for models that:
+# • Store global configuration or reference data
+# • Handle system-wide logging, auditing, or monitoring
+# • Manage background jobs or system processes
+# • Represent system administrators or service accounts
+# • Contain data that should be accessible across all tenants
+# • Do not have an organization_id column by design
+#
+# DO NOT use SystemScoped for:
+# • Business models that should be tenant-specific
+# • User-generated content models
+# • Models that have organization_id but want to bypass scoping temporarily
+#   (use TenantScoped bypass methods instead)
+#
+module SystemScoped
+  extend ActiveSupport::Concern
+
+  # Mark this model as system-scoped (not tenant-scoped)
+  included do
+    # Add a class method to easily identify system-scoped models
+    def self.system_scoped?
+      true
+    end
+
+    # Prevent accidental inclusion of TenantScoped
+    def self.tenant_scoped?
+      false
+    end
+
+    # Add metadata for introspection
+    def self.scoping_type
+      :system
+    end
+
+    # Validation to ensure this model shouldn't have organization_id
+    validate :ensure_no_organization_id_with_system_scoped, if: -> { respond_to?(:<%= @organization_name.underscore %>_id) }
+
+    private
+
+    def ensure_no_organization_id_with_system_scoped
+      if respond_to?(:<%= @organization_name.underscore %>_id) && self.<%= @organization_name.underscore %>_id.present?
+        errors.add(:<%= @organization_name.underscore %>_id,
+          "should not be set on SystemScoped models. This model is marked as system-scoped " \
+          "and should not belong to any specific <%= @organization_name.underscore %>."
+        )
+      end
+    end
+  end
+
+  # Class methods for system-scoped models
+  module ClassMethods
+    # Verify this model should not have organization associations
+    def validate_system_scoped_compatibility!
+      if column_names.include?('<%= @organization_name.underscore %>_id')
+        Rails.logger.warn(
+          "[TENANT_WARNING] Model #{self.name} includes SystemScoped but has <%= @organization_name.underscore %>_id column. " \
+          "Consider removing the column or using TenantScoped instead."
+        )
+      end
+
+      if respond_to?(:reflect_on_association) && reflect_on_association(:<%= @organization_name.underscore %>)
+        Rails.logger.warn(
+          "[TENANT_WARNING] Model #{self.name} includes SystemScoped but has <%= @organization_name.underscore %> association. " \
+          "This may cause confusion. Consider removing the association."
+        )
+      end
+    end
+
+    # Helper method to check if a model is system-scoped
+    def system_scoped?
+      true
+    end
+
+    # Helper method to check if a model is tenant-scoped (always false for SystemScoped)
+    def tenant_scoped?
+      false
+    end
+
+    # Get the scoping type for this model
+    def scoping_type
+      :system
+    end
+
+    # Get all system-scoped models in the application
+    def self.all_system_scoped_models
+      @all_system_scoped_models ||= []
+    end
+
+    # Register this model as system-scoped
+    def self.register_system_scoped_model(model_class)
+      all_system_scoped_models << model_class unless all_system_scoped_models.include?(model_class)
+    end
+  end
+
+  # Register this model when the module is included
+  def self.included(base)
+    super
+    SystemScoped.register_system_scoped_model(base)
+
+    # Perform compatibility validation in development/test
+    if Rails.env.development? || Rails.env.test?
+      Rails.application.config.after_initialize do
+        base.validate_system_scoped_compatibility!
+      end
+    end
+  end
+end
+
+# Configuration and helper methods for system scoping
+module SystemScoped::Configuration
+  extend self
+
+  # Get list of model classes that should never be tenant-scoped
+  # This can be configured in an initializer:
+  #
+  #   SystemScoped::Configuration.excluded_models = [
+  #     'AuditLog',
+  #     'SystemConfiguration',
+  #     'DelayedJob'
+  #   ]
+  #
+  def excluded_models
+    @excluded_models ||= default_excluded_models
+  end
+
+  def excluded_models=(model_list)
+    @excluded_models = Array(model_list).map(&:to_s)
+  end
+
+  # Check if a model class should be excluded from tenant scoping
+  def excluded_model?(model_class)
+    model_name = model_class.is_a?(String) ? model_class : model_class.name
+    excluded_models.include?(model_name)
+  end
+
+  # Default list of commonly excluded model patterns
+  def default_excluded_models
+    %w[
+      DelayedJob
+      ActiveJob::QueueAdapters::DelayedJobAdapter::JobWrapper
+      ActionMailbox::InboundEmail
+      ActionText::RichText
+      ActionText::EncryptedRichText
+      ActiveStorage::Blob
+      ActiveStorage::Attachment
+      ActiveStorage::VariantRecord
+      AuditLog
+      SystemLog
+      ActivityLog
+      SystemConfiguration
+      GlobalSetting
+      AdminUser
+      ServiceAccount
+      Country
+      State
+      Province
+      Currency
+      Timezone
+      Language
+      Translation
+    ]
+  end
+
+  # Add a model to the exclusion list
+  def exclude_model(model_class)
+    model_name = model_class.is_a?(String) ? model_class : model_class.name
+    excluded_models << model_name unless excluded_models.include?(model_name)
+  end
+
+  # Remove a model from the exclusion list
+  def include_model(model_class)
+    model_name = model_class.is_a?(String) ? model_class : model_class.name
+    excluded_models.delete(model_name)
+  end
+
+  # Clear all exclusions (dangerous - use with caution)
+  def clear_exclusions!
+    @excluded_models = []
+  end
+
+  # Check if a model has the required organization_id column
+  def model_has_organization_column?(model_class)
+    return false unless model_class.respond_to?(:column_names)
+    model_class.column_names.include?('<%= @organization_name.underscore %>_id')
+  end
+
+  # Validate that a model is compatible with tenant scoping
+  def validate_tenant_scoping_compatibility!(model_class)
+    model_name = model_class.name
+
+    # Check if model is explicitly excluded
+    if excluded_model?(model_class)
+      raise SystemScoped::IncompatibleModelError,
+        "Model #{model_name} is configured as excluded from tenant scoping. " \
+        "Use SystemScoped instead of TenantScoped."
+    end
+
+    # Check if model implements SystemScoped
+    if model_class.respond_to?(:system_scoped?) && model_class.system_scoped?
+      raise SystemScoped::IncompatibleModelError,
+        "Model #{model_name} includes SystemScoped and cannot also include TenantScoped. " \
+        "Choose either SystemScoped (for global models) or TenantScoped (for tenant-specific models)."
+    end
+
+    # Check if model has the required organization_id column
+    unless model_has_organization_column?(model_class)
+      raise SystemScoped::MissingColumnError,
+        "Model #{model_name} does not have <%= @organization_name.underscore %>_id column required for tenant scoping. " \
+        "Either add the column with a migration or use SystemScoped if this model should be global."
+    end
+
+    true
+  end
+
+  # Get all models that should be system-scoped (global)
+  def system_scoped_models
+    models = []
+
+    # Add explicitly excluded models
+    excluded_models.each do |model_name|
+      begin
+        model_class = model_name.constantize
+        models << model_class if model_class.is_a?(Class)
+      rescue NameError
+        # Model doesn't exist, skip it
+      end
+    end
+
+    # Add models that include SystemScoped
+    models += SystemScoped.all_system_scoped_models
+
+    models.uniq
+  end
+
+  # Get all models that should be tenant-scoped
+  def tenant_scoped_models
+    models = []
+
+    # Find all ApplicationRecord subclasses
+    if defined?(ApplicationRecord)
+      ApplicationRecord.descendants.each do |model_class|
+        next if excluded_model?(model_class)
+        next if model_class.respond_to?(:system_scoped?) && model_class.system_scoped?
+        next unless model_has_organization_column?(model_class)
+
+        models << model_class
+      end
+    end
+
+    models
+  end
+
+  # Error classes for better error handling
+  class IncompatibleModelError < StandardError; end
+  class MissingColumnError < StandardError; end
+end
+
+# Integration with Rails application
+if defined?(Rails::Railtie)
+  class SystemScoped::Railtie < Rails::Railtie
+    config.after_initialize do
+      # Validate all models in development
+      if Rails.env.development?
+        Rails.application.eager_load! if Rails.application.config.eager_load
+
+        # Log summary of scoping configuration
+        system_models = SystemScoped::Configuration.system_scoped_models
+        tenant_models = SystemScoped::Configuration.tenant_scoped_models
+
+        Rails.logger.info("[TENANT_SCOPING] Found #{system_models.count} system-scoped models")
+        Rails.logger.info("[TENANT_SCOPING] Found #{tenant_models.count} tenant-scoped models")
+
+        if Rails.logger.debug?
+          Rails.logger.debug("[TENANT_SCOPING] System models: #{system_models.map(&:name).join(', ')}")
+          Rails.logger.debug("[TENANT_SCOPING] Tenant models: #{tenant_models.map(&:name).join(', ')}")
+        end
+      end
+    end
+  end
+end
