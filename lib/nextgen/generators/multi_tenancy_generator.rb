@@ -45,6 +45,7 @@ module Nextgen
         include_tenant_scoped_concern_in_existing_models
         handle_models_without_tables
         update_existing_model_associations
+        generate_data_migration_guidance
         offer_missing_table_migrations unless options[:skip_migrations]
 
         log_completion("Multi-tenancy setup completed successfully!")
@@ -1360,6 +1361,298 @@ module Nextgen
         # For polymorphic belongs_to, we add a validation instead of a scope
         # The scope would be added to the polymorphic target models instead
         "belongs_to :#{name}#{options ? ", #{options}" : ''}"
+      end
+
+      # Generate data migration guidance for assigning existing records to organizations
+      def generate_data_migration_guidance
+        return unless (@models_needing_org_id&.any? || @models_already_compatible&.any?)
+
+        log_section "GENERATING DATA MIGRATION GUIDANCE"
+        log_step "Creating guidance for assigning existing records to organizations...", :info
+
+        models_with_data = (@models_needing_org_id || []) + (@models_already_compatible || [])
+
+        if models_with_data.empty?
+          log_step "No models require data migration guidance", :info
+          return
+        end
+
+        # Create a data migration template file
+        guidance_file = "db/data_migration_guidance.md"
+
+        template_content = build_data_migration_guidance_content(models_with_data)
+
+        create_file guidance_file, template_content
+
+        log_step "✓ Created data migration guidance: #{guidance_file}", :success
+        log_step "Review the guidance file and create appropriate data migrations", :info
+        log_step "Consider running: rails generate migration AssignExistingRecordsToOrganizations", :info
+      end
+
+      # Build the content for the data migration guidance document
+      def build_data_migration_guidance_content(models_with_data)
+        org_name = @organization_name.underscore
+        org_class = @organization_name
+        tenant_column = @tenant_column
+
+        content = <<~MARKDOWN
+          # Data Migration Guidance for Multi-Tenancy
+
+          After adding multi-tenancy support to your Rails application, you'll need to assign existing records
+          to organizations. This guide provides strategies and sample code for migrating your existing data.
+
+          ## Overview
+
+          The following models now require organization assignment:
+          #{models_with_data.map { |m| "- #{m[:name]}" }.join("\n")}
+
+          ## Migration Strategy Options
+
+          ### Option 1: Single Default Organization (Recommended for simple cases)
+
+          If all existing data should belong to a single organization:
+
+          ```ruby
+          class AssignExistingRecordsToDefaultOrganization < ActiveRecord::Migration[#{rails_version_for_migration}]
+            def up
+              # Create a default organization for existing data
+              default_org = #{org_class}.find_or_create_by!(
+                name: "Default Organization",
+                # Add other required fields as needed
+              )
+
+              # Assign existing records to the default organization
+          #{build_model_assignment_code(models_with_data, org_name, tenant_column, '    ')}
+            end
+
+            def down
+              # This migration cannot be safely reversed as it would leave records orphaned
+              raise ActiveRecord::IrreversibleMigration,
+                "Cannot reverse data assignment - would leave records without organization"
+            end
+          end
+          ```
+
+          ### Option 2: User-Based Organization Assignment
+
+          If records should be assigned based on their associated users:
+
+          ```ruby
+          class AssignRecordsBasedOnUsers < ActiveRecord::Migration[#{rails_version_for_migration}]
+            def up
+              # Ensure every user has a default organization
+              User.find_each do |user|
+                unless user.organizations.exists?
+                  org = #{org_class}.create!(
+                    name: "\#{user.email&.split('@')&.first&.humanize || 'User'} Organization"
+                  )
+
+                  # Create membership for the user
+                  Membership.create!(
+                    user: user,
+                    #{org_name}: org,
+                    role: Role.find_or_create_by!(name: 'owner')
+                  )
+                end
+              end
+
+              # Assign records to user's primary organization
+          #{build_user_based_assignment_code(models_with_data, org_name, tenant_column, '    ')}
+            end
+
+            def down
+              raise ActiveRecord::IrreversibleMigration, "Cannot reverse user-based assignment"
+            end
+          end
+          ```
+
+          ### Option 3: Interactive Assignment (For complex cases)
+
+          For cases requiring manual review:
+
+          ```ruby
+          class InteractiveRecordAssignment < ActiveRecord::Migration[#{rails_version_for_migration}]
+            def up
+              # List all organizations for reference
+              puts "Available Organizations:"
+              #{org_class}.all.each_with_index do |org, index|
+                puts "\#{index + 1}. \#{org.name} (ID: \#{org.id})"
+              end
+
+              # Process each model with unassigned records
+          #{build_interactive_assignment_code(models_with_data, org_name, tenant_column, '    ')}
+            end
+
+            def down
+              raise ActiveRecord::IrreversibleMigration, "Interactive assignment cannot be reversed"
+            end
+          end
+          ```
+
+          ## Important Considerations
+
+          ### 1. Data Validation
+          Before running any data migration:
+          - Backup your database
+          - Run migrations in a staging environment first
+          - Verify data integrity after migration
+
+          ### 2. Performance
+          For large datasets, consider:
+          - Using `find_in_batches` or `in_batches` for memory efficiency
+          - Running migrations during low-traffic periods
+          - Monitoring query performance and database locks
+
+          ### 3. Foreign Key Constraints
+          The organization_id columns have foreign key constraints. Ensure:
+          - All assigned organization IDs exist in the organizations table
+          - No NULL values are assigned (unless the column allows it)
+
+          ### 4. Application Logic
+          After data migration:
+          - Test your application thoroughly
+          - Verify that tenant scoping works correctly
+          - Check that associations return expected results
+
+          ## Sample Testing Commands
+
+          After running your data migration, verify the results:
+
+          ```ruby
+          # In Rails console:
+
+          # Verify all records have organizations
+          #{models_with_data.map { |m| "#{m[:name]}.where(#{tenant_column}: nil).count # Should be 0" }.join("\n")}
+
+          # Test tenant scoping
+          first_org = #{org_class}.first
+          #{org_class}.current = first_org
+
+          # These should only return records for the current organization
+          #{models_with_data.map { |m| "puts \"#{m[:name]}: \#{#{m[:name]}.count} records\"" }.join("\n")}
+          ```
+
+          ## Next Steps
+
+          1. Choose the appropriate migration strategy for your use case
+          2. Create a new migration file: `rails generate migration YourMigrationName`
+          3. Copy and adapt the relevant code from above
+          4. Test the migration thoroughly
+          5. Run the migration: `rails db:migrate`
+          6. Verify data integrity and application functionality
+
+          For questions or issues, refer to the Rails migration documentation or the multi-tenancy generator documentation.
+        MARKDOWN
+
+        content
+      end
+
+      # Build assignment code for the default organization strategy
+      def build_model_assignment_code(models_with_data, org_name, tenant_column, indent)
+        models_with_data.map do |model_info|
+          model_name = model_info[:name]
+          model_table_name = model_name.underscore.pluralize
+          <<~RUBY.gsub(/^/, indent)
+            # Assign #{model_name} records
+            #{model_name}.where(#{tenant_column}: nil).find_each do |record|
+              record.update!(#{tenant_column}: default_org.id)
+            end
+            puts "Assigned \#{#{model_name}.where(#{tenant_column}: default_org.id).count} #{model_table_name}"
+          RUBY
+        end.join("\n")
+      end
+
+      # Build assignment code for user-based organization strategy
+      def build_user_based_assignment_code(models_with_data, org_name, tenant_column, indent)
+        models_with_data.map do |model_info|
+          model_name = model_info[:name]
+          model_class = model_info[:model]
+          model_table_name = model_name.underscore.pluralize
+
+          # Check if model has a user association
+          has_user_association = begin
+            model_class.reflect_on_association(:user) ||
+            model_class.reflect_on_association(:owner) ||
+            model_class.reflect_on_association(:creator)
+          rescue
+            false
+          end
+
+          if has_user_association
+            user_field = begin
+              if model_class.reflect_on_association(:user)
+                'user'
+              elsif model_class.reflect_on_association(:owner)
+                'owner'
+              elsif model_class.reflect_on_association(:creator)
+                'creator'
+              else
+                'user' # fallback
+              end
+            rescue
+              'user' # fallback on any error
+            end
+
+            <<~RUBY.gsub(/^/, indent)
+              # Assign #{model_name} records based on #{user_field}
+              #{model_name}.includes(:#{user_field}).where(#{tenant_column}: nil).find_each do |record|
+                if record.#{user_field}&.organizations&.exists?
+                  primary_org = record.#{user_field}.organizations.first
+                  record.update!(#{tenant_column}: primary_org.id)
+                end
+              end
+              puts "Assigned \#{#{model_name}.where.not(#{tenant_column}: nil).count} #{model_table_name}"
+            RUBY
+          else
+            <<~RUBY.gsub(/^/, indent)
+              # #{model_name} doesn't have a clear user association
+              # Consider manual assignment or alternative strategy
+              # #{model_name}.where(#{tenant_column}: nil).update_all(#{tenant_column}: default_org_id)
+              puts "#{model_name}: \#{#{model_name}.where(#{tenant_column}: nil).count} records need manual assignment"
+            RUBY
+          end
+        end.join("\n")
+      end
+
+      # Build assignment code for interactive strategy
+      def build_interactive_assignment_code(models_with_data, org_name, tenant_column, indent)
+        models_with_data.map do |model_info|
+          model_name = model_info[:name]
+          model_table_name = model_name.underscore.pluralize
+          <<~RUBY.gsub(/^/, indent)
+            # #{model_name} records
+            unassigned_#{model_table_name} = #{model_name}.where(#{tenant_column}: nil)
+            if unassigned_#{model_table_name}.exists?
+              puts "\\n#{model_name} has \#{unassigned_#{model_table_name}.count} unassigned records"
+              puts "Sample records:"
+              unassigned_#{model_table_name}.limit(5).each do |record|
+                puts "  ID: \#{record.id}, \#{record.respond_to?(:name) ? record.name : record.inspect}"
+              end
+
+              print "Enter organization ID for all #{model_table_name} (or 'skip'): "
+              input = STDIN.gets.chomp
+
+              unless input.downcase == 'skip'
+                org_id = input.to_i
+                if #{@organization_name}.exists?(org_id)
+                  unassigned_#{model_table_name}.update_all(#{tenant_column}: org_id)
+                  puts "Assigned all #{model_table_name} to organization \#{org_id}"
+                else
+                  puts "Invalid organization ID. Skipping #{model_name}."
+                end
+              end
+            end
+          RUBY
+        end.join("\n")
+      end
+
+      # Get the Rails version for migrations
+      def rails_version_for_migration
+        if defined?(Rails) && Rails.respond_to?(:version)
+          Rails.version
+        else
+          "7.0" # Default fallback
+        end
       end
     end
   end
