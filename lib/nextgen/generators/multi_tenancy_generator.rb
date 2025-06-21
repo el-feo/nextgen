@@ -42,6 +42,9 @@ module Nextgen
 
         scan_existing_models_for_tenant_integration
         generate_tenant_migrations_for_existing_models
+        include_tenant_scoped_concern_in_existing_models
+        handle_models_without_tables
+        offer_missing_table_migrations unless options[:skip_migrations]
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -432,6 +435,7 @@ module Nextgen
 
         scan_existing_models_for_tenant_integration
         generate_tenant_migrations_for_existing_models
+        include_tenant_scoped_concern_in_existing_models
 
         log_completion("Multi-tenancy setup completed successfully!")
       end
@@ -746,6 +750,73 @@ module Nextgen
         log_step "✓ Generated #{@models_needing_org_id.count} migration(s) for existing models", :success
       end
 
+      # Include TenantScoped concern in existing models that need it
+      def include_tenant_scoped_concern_in_existing_models
+        models_to_update = (@models_needing_org_id || []) + (@models_already_compatible || [])
+
+        return unless models_to_update.any?
+
+        log_section "INCLUDING TENANT SCOPED CONCERN IN EXISTING MODELS"
+        log_step "Adding TenantScoped concern to compatible models...", :info
+
+        models_to_update.each do |model_result|
+          include_tenant_scoped_in_model(model_result)
+        end
+
+        log_step "✓ Updated #{models_to_update.count} model(s) with TenantScoped concern", :success
+      end
+
+      # Include TenantScoped concern in a specific model file
+      def include_tenant_scoped_in_model(model_result)
+        model_class = model_result[:model]
+        model_name = model_result[:name]
+
+        # Calculate model file path
+        model_file_path = "app/models/#{model_name.underscore}.rb"
+
+        # Check if file exists
+        unless File.exist?(model_file_path)
+          log_step "Skipping #{model_name}: Model file not found at #{model_file_path}", :warning
+          return
+        end
+
+        # Check if TenantScoped is already included
+        model_content = File.read(model_file_path)
+        if model_content.match?(/^\s*include\s+TenantScoped\b/)
+          log_step "Skipping #{model_name}: TenantScoped already included", :info
+          return
+        end
+
+        log_step "Adding TenantScoped concern to #{model_name}", :info
+
+        # Use Rails generator methods to inject the concern
+        # Try inject_into_class first (more reliable)
+        begin
+          inject_into_class model_file_path, model_name do
+            "  include TenantScoped\n"
+          end
+          log_step "✓ Added TenantScoped to #{model_name} using inject_into_class", :success
+        rescue Thor::Error => e
+          # Fallback to inject_into_file if inject_into_class fails
+          log_step "inject_into_class failed for #{model_name}, trying fallback method: #{e.message}", :warning
+
+          # Find the class declaration line and inject after it
+          class_pattern = /^(\s*)class\s+#{Regexp.escape(model_name)}\b.*$/
+
+          if model_content.match?(class_pattern)
+            inject_into_file model_file_path, after: class_pattern do
+              "\n  include TenantScoped\n"
+            end
+            log_step "✓ Added TenantScoped to #{model_name} using inject_into_file", :success
+          else
+            log_step "Could not find class declaration for #{model_name} in #{model_file_path}", :error
+            return
+          end
+        end
+      rescue => e
+        log_step "Error updating #{model_name}: #{e.message}", :error
+      end
+
       # Generate a single migration for adding organization_id to a specific model
       def generate_tenant_migration_for_model(model_result)
         model_class = model_result[:model]
@@ -857,6 +928,197 @@ module Nextgen
         # Check for valid database column name format
         # Must start with letter or underscore, followed by letters, numbers, or underscores
         name.match?(/\A[a-z_][a-z0-9_]*\z/) && name.length <= 63 # PostgreSQL limit
+      end
+
+      # Handle models without corresponding database tables gracefully
+      def handle_models_without_tables
+        return unless @models_without_tables&.any?
+
+        log_section "HANDLING MODELS WITHOUT DATABASE TABLES"
+        log_step "Found #{@models_without_tables.count} model(s) without corresponding database tables", :warning
+
+        @models_without_tables.each do |model_result|
+          handle_model_without_table(model_result)
+        end
+
+        log_step "✓ Processed #{@models_without_tables.count} model(s) without tables", :info
+      end
+
+      # Handle a single model without a database table
+      def handle_model_without_table(model_result)
+        model_class = model_result[:model]
+        model_name = model_result[:name]
+
+        log_step "Analyzing #{model_name}:", :info
+
+        # Check if this is a concern, service object, or other non-persistent model
+        model_type = determine_model_type(model_class)
+
+        case model_type
+        when :concern
+          say "  • #{model_name} appears to be a concern - no action needed", :green
+        when :service_object
+          say "  • #{model_name} appears to be a service object - no action needed", :green
+        when :form_object
+          say "  • #{model_name} appears to be a form object - no action needed", :green
+        when :decorator
+          say "  • #{model_name} appears to be a decorator - no action needed", :green
+        when :abstract_model
+          say "  • #{model_name} is an abstract model - no action needed", :green
+        when :possibly_missing_table
+          handle_possibly_missing_table(model_result)
+        else
+          handle_unknown_tableless_model(model_result)
+        end
+      end
+
+      # Determine the type of a model without a table
+      def determine_model_type(model_class)
+        model_name = model_class.name
+
+        # Check if it's an abstract class
+        return :abstract_model if model_class.abstract_class?
+
+        # Check for concern patterns (including -able suffix pattern)
+        if model_name.end_with?('Concern') ||
+           model_class.ancestors.include?(ActiveSupport::Concern) ||
+           model_class.included_modules.any? { |mod| mod.name == 'ActiveSupport::Concern' } ||
+           (model_name.match?(/^[A-Z][a-z]*able$/) && !model_name.end_with?('Table'))
+          return :concern
+        end
+
+        # Check for service object patterns
+        if model_name.end_with?('Service') ||
+           model_name.end_with?('Handler') ||
+           model_name.end_with?('Command') ||
+           model_name.end_with?('Query')
+          return :service_object
+        end
+
+        # Check for form object patterns
+        if model_name.end_with?('Form') ||
+           model_name.end_with?('FormObject') ||
+           model_class.ancestors.any? { |ancestor| ancestor.name&.include?('Form') }
+          return :form_object
+        end
+
+        # Check for decorator patterns
+        if model_name.end_with?('Decorator') ||
+           model_name.end_with?('Presenter') ||
+           model_class.ancestors.any? { |ancestor| ancestor.name&.include?('Decorator') }
+          return :decorator
+        end
+
+        # If it inherits from ApplicationRecord but has no table, it might be missing a migration
+        # Only classify as possibly_missing_table if it looks like a typical Rails model name
+        if model_class < ApplicationRecord &&
+           model_name.match?(/^[A-Z][a-zA-Z]*$/) &&
+           !model_name.match?(/^[A-Z][a-z]*able$/) && # Not a concern-like name
+           !model_name.include?('Class') # Generic class names are unlikely to be models
+          return :possibly_missing_table
+        end
+
+        :unknown
+      end
+
+      # Handle a model that might be missing its database table
+      def handle_possibly_missing_table(model_result)
+        model_name = model_result[:name]
+
+        say "  • #{model_name} inherits from ApplicationRecord but has no table", :red
+        say "    Possible actions:", :cyan
+        say "    - Create missing migration: `bin/rails generate migration Create#{model_name.pluralize}`", :cyan
+        say "    - Move to app/lib if it's not meant to be a persistent model", :cyan
+        say "    - Delete the file if it's no longer needed", :cyan
+
+        # Store this model for potential migration generation
+        @models_missing_tables ||= []
+        @models_missing_tables << model_result
+      end
+
+      # Handle models of unknown type without tables
+      def handle_unknown_tableless_model(model_result)
+        model_name = model_result[:name]
+
+        say "  • #{model_name} - unclear model type without database table", :yellow
+        say "    Recommendations:", :cyan
+        say "    - Review if this model should have a database table", :cyan
+        say "    - Consider moving to app/lib if it's a utility class", :cyan
+        say "    - Consider making it an abstract class if it's meant to be inherited", :cyan
+        say "    - Add table_name = nil if it's intentionally tableless", :cyan
+      end
+
+      # Offer to generate migrations for models that appear to be missing tables
+      def offer_missing_table_migrations
+        return unless @models_missing_tables&.any?
+
+        log_section "MISSING TABLE MIGRATIONS"
+
+        say "The following models appear to be missing database tables:", :warning
+        @models_missing_tables.each do |model_result|
+          say "  • #{model_result[:name]}", :red
+        end
+
+        if yes?("\nWould you like to generate basic migrations for these models? (y/n)")
+          @models_missing_tables.each do |model_result|
+            generate_basic_table_migration(model_result)
+          end
+        else
+          say "Skipping migration generation. You can manually create these later.", :info
+        end
+      end
+
+      # Generate a basic table migration for a model missing its table
+      def generate_basic_table_migration(model_result)
+        model_name = model_result[:name]
+        table_name = model_name.underscore.pluralize
+
+        log_step "Generating basic migration for #{model_name}", :info
+
+        # Generate a basic create table migration
+        migration_class_name = "Create#{model_name.pluralize}"
+
+        # Generate unique timestamp to avoid conflicts
+        @migration_counter ||= 0
+        @migration_counter += 1
+        adjusted_timestamp = (Time.current + @migration_counter.seconds).strftime("%Y%m%d%H%M%S")
+
+        migration_filename = "#{adjusted_timestamp}_#{migration_class_name.underscore}.rb"
+        migration_path = "db/migrate/#{migration_filename}"
+
+        # Create basic migration content
+        migration_content = generate_basic_migration_content(table_name, model_name)
+
+        create_file migration_path, migration_content
+
+        log_step "✓ Created basic migration: #{migration_path}", :success
+        say "    Remember to customize the migration with appropriate columns!", :yellow
+      end
+
+      # Generate basic migration content for a missing table
+      def generate_basic_migration_content(table_name, model_name)
+        migration_version = get_rails_migration_version
+
+        <<~RUBY
+          class Create#{model_name.pluralize} < ActiveRecord::Migration[#{migration_version}]
+            def change
+              create_table :#{table_name} do |t|
+                # TODO: Add your columns here
+                # Example columns:
+                # t.string :name, null: false
+                # t.text :description
+
+                # Add organization_id for tenant scoping
+                t.references :organization, null: false, foreign_key: true, index: true
+
+                t.timestamps
+              end
+
+              # Add indexes as needed
+              # add_index :#{table_name}, :some_column
+            end
+          end
+        RUBY
       end
     end
   end
