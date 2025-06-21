@@ -40,6 +40,8 @@ module Nextgen
         generate_tenant_scoped_concern unless @skip_concerns
         generate_tenant_scoping_initializer
 
+        scan_existing_models_for_tenant_integration
+
         log_completion("Multi-tenancy setup completed successfully!")
       end
 
@@ -426,6 +428,10 @@ module Nextgen
         log_step "Include 'TenantScoped::ControllerHelpers' in ApplicationController", :info
 
         generate_system_scoped_interface unless @skip_concerns
+
+        scan_existing_models_for_tenant_integration
+
+        log_completion("Multi-tenancy setup completed successfully!")
       end
 
       # Generate the SystemScoped interface for models that should not be tenant-scoped
@@ -471,7 +477,258 @@ module Nextgen
         log_step "Tenant scoping configuration created successfully", :success
       end
 
-      private
+      # Scan existing models and identify which need organization_id columns
+      def scan_existing_models_for_tenant_integration
+        log_section "SCANNING EXISTING MODELS"
+        log_step "Analyzing existing models for tenant scoping compatibility...", :info
+
+        # Load all models to ensure they're available for introspection
+        Rails.application.eager_load! if defined?(Rails.application)
+
+        # Find all ApplicationRecord descendants
+        existing_models = discover_existing_models
+
+        if existing_models.empty?
+          log_step "No existing models found to analyze", :info
+          return
+        end
+
+        log_step "Found #{existing_models.count} existing models to analyze", :success
+
+        # Categorize models
+        models_needing_org_id = []
+        models_already_compatible = []
+        models_to_exclude = []
+        models_without_tables = []
+
+        existing_models.each do |model_class|
+          result = analyze_model_for_tenant_compatibility(model_class)
+
+          case result[:status]
+          when :needs_org_id
+            models_needing_org_id << result
+          when :already_compatible
+            models_already_compatible << result
+          when :should_exclude
+            models_to_exclude << result
+          when :no_table
+            models_without_tables << result
+          end
+        end
+
+        # Report findings
+        report_model_analysis_results(
+          models_needing_org_id,
+          models_already_compatible,
+          models_to_exclude,
+          models_without_tables
+        )
+
+        # Store results for use in subsequent tasks
+        @models_needing_org_id = models_needing_org_id
+        @models_already_compatible = models_already_compatible
+        @models_to_exclude = models_to_exclude
+        @models_without_tables = models_without_tables
+      end
+
+      # Discover all existing models that inherit from ApplicationRecord
+      def discover_existing_models
+        models = []
+
+        # Ensure Rails is loaded
+        return models unless defined?(Rails) && Rails.application
+
+        # Load all files to ensure all models are defined
+        Rails.application.eager_load!
+
+        # Find all classes that inherit from ApplicationRecord
+        ObjectSpace.each_object(Class).select do |klass|
+          begin
+            # Check if class inherits from ApplicationRecord and has a valid name
+            if klass < ApplicationRecord &&
+               !klass.abstract_class? &&
+               klass.name.present? &&
+               !klass.name.include?("Anonymous") &&
+               !klass.name.include?("HABTM_")
+
+              models << klass
+            end
+          rescue => e
+            # Skip classes that cause issues during introspection
+            log_step "Skipping model #{klass.name || 'unnamed'}: #{e.message}", :debug if options[:verbose]
+          end
+        end
+
+        # Sort by name for consistent output
+        models.sort_by(&:name)
+      end
+
+      # Analyze a model to determine its tenant compatibility status
+      def analyze_model_for_tenant_compatibility(model_class)
+        model_name = model_class.name
+        result = {
+          model: model_class,
+          name: model_name,
+          table_name: nil,
+          status: nil,
+          reason: nil,
+          recommendations: []
+        }
+
+        begin
+          # Check if model has a table
+          unless model_class.table_exists?
+            result[:status] = :no_table
+            result[:reason] = "Model does not have a corresponding database table"
+            result[:recommendations] = ["Create database table", "or remove unused model file"]
+            return result
+          end
+
+          result[:table_name] = model_class.table_name
+
+          # Check if model should be excluded (system models)
+          if should_exclude_model?(model_class)
+            result[:status] = :should_exclude
+            result[:reason] = "Model is a system model or explicitly excluded"
+            result[:recommendations] = ["Consider adding SystemScoped concern for clarity"]
+            return result
+          end
+
+          # Check if model already has organization_id column
+          if model_class.column_names.include?(@tenant_column)
+            result[:status] = :already_compatible
+            result[:reason] = "Model already has #{@tenant_column} column"
+            result[:recommendations] = ["Add TenantScoped concern if not already included"]
+            return result
+          end
+
+          # Model needs organization_id column
+          result[:status] = :needs_org_id
+          result[:reason] = "Model does not have #{@tenant_column} column"
+          result[:recommendations] = [
+            "Add migration to add #{@tenant_column} column",
+            "Include TenantScoped concern",
+            "Consider data migration for existing records"
+          ]
+
+        rescue => e
+          result[:status] = :error
+          result[:reason] = "Error analyzing model: #{e.message}"
+          result[:recommendations] = ["Review model definition", "Check for syntax errors"]
+        end
+
+        result
+      end
+
+      # Determine if a model should be excluded from tenant scoping
+      def should_exclude_model?(model_class)
+        model_name = model_class.name
+
+        # System models that typically should not be tenant-scoped
+        system_models = %w[
+          User
+          Organization
+          Role
+          Membership
+          ActiveStorage::Blob
+          ActiveStorage::Attachment
+          ActiveStorage::VariantRecord
+          ActionText::RichText
+          ActionText::EncryptedRichText
+          ActionMailbox::InboundEmail
+          ActiveRecord::SchemaMigration
+          ActiveRecord::InternalMetadata
+          SolidQueue::Job
+          SolidQueue::ScheduledExecution
+          SolidQueue::ClaimedExecution
+          SolidQueue::BlockedExecution
+          SolidQueue::FailedExecution
+          SolidQueue::Pause
+          SolidQueue::Process
+          SolidQueue::ReadyExecution
+          Ahoy::Visit
+          Ahoy::Event
+        ].map(&:downcase)
+
+        # Check if model name matches any system model
+        return true if system_models.include?(model_name.downcase)
+
+        # Check if model includes SystemScoped concern
+        return true if model_class.included_modules.any? { |mod| mod.name == "SystemScoped" }
+
+        # Check if model is in a namespace that suggests it's a system model
+        return true if model_name.match?(/^(ActiveRecord|ActionText|ActionMailbox|ActiveStorage|SolidQueue|Ahoy)::/i)
+
+        # Check if model is explicitly excluded via configuration
+        # (This would be loaded from a configuration file in a real implementation)
+        excluded_models = get_excluded_models_from_config
+        return true if excluded_models.include?(model_name)
+
+        false
+      end
+
+      # Get excluded models from configuration (placeholder for future configuration system)
+      def get_excluded_models_from_config
+        # This would eventually read from a configuration file
+        # For now, return empty array
+        []
+      end
+
+      # Report the results of model analysis
+      def report_model_analysis_results(models_needing_org_id, models_already_compatible, models_to_exclude, models_without_tables)
+        log_section "MODEL ANALYSIS RESULTS"
+
+        if models_needing_org_id.any?
+          log_step "Models requiring #{@tenant_column} column (#{models_needing_org_id.count}):", :warning
+          models_needing_org_id.each do |result|
+            say "  • #{result[:name]} (#{result[:table_name]})", :yellow
+            result[:recommendations].each do |rec|
+              say "    - #{rec}", :cyan
+            end
+          end
+          say ""
+        end
+
+        if models_already_compatible.any?
+          log_step "Models already compatible (#{models_already_compatible.count}):", :success
+          models_already_compatible.each do |result|
+            say "  • #{result[:name]} (#{result[:table_name]})", :green
+          end
+          say ""
+        end
+
+        if models_to_exclude.any?
+          log_step "Models excluded from tenant scoping (#{models_to_exclude.count}):", :info
+          models_to_exclude.each do |result|
+            say "  • #{result[:name]} - #{result[:reason]}", :blue
+          end
+          say ""
+        end
+
+        if models_without_tables.any?
+          log_step "Models without database tables (#{models_without_tables.count}):", :warning
+          models_without_tables.each do |result|
+            say "  • #{result[:name]} - #{result[:reason]}", :red
+          end
+          say ""
+        end
+
+        # Summary
+        total_models = models_needing_org_id.count + models_already_compatible.count +
+                      models_to_exclude.count + models_without_tables.count
+
+        log_step "Summary:", :info
+        say "  Total models analyzed: #{total_models}", :cyan
+        say "  Models needing migration: #{models_needing_org_id.count}", :yellow
+        say "  Models already compatible: #{models_already_compatible.count}", :green
+        say "  Models excluded: #{models_to_exclude.count}", :blue
+        say "  Models without tables: #{models_without_tables.count}", :red
+
+        # Store detailed results for next steps
+        if models_needing_org_id.any?
+          log_step "Next steps will include generating migrations for models needing #{@tenant_column}", :info
+        end
+      end
 
       def rails_version_compatible?
         # Support Rails 6.0+ through Rails 8+
