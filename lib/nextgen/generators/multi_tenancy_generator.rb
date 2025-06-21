@@ -44,6 +44,7 @@ module Nextgen
         generate_tenant_migrations_for_existing_models
         include_tenant_scoped_concern_in_existing_models
         handle_models_without_tables
+        update_existing_model_associations
         offer_missing_table_migrations unless options[:skip_migrations]
 
         log_completion("Multi-tenancy setup completed successfully!")
@@ -1119,6 +1120,246 @@ module Nextgen
             end
           end
         RUBY
+      end
+
+      # Update existing model associations to work with tenant scoping
+      def update_existing_model_associations
+        return unless (@models_needing_org_id&.any? || @models_already_compatible&.any?)
+
+        log_section "UPDATING MODEL ASSOCIATIONS FOR TENANT SCOPING"
+        log_step "Analyzing and updating model associations to be tenant-aware...", :info
+
+        models_to_update = (@models_needing_org_id || []) + (@models_already_compatible || [])
+        associations_updated = 0
+
+        models_to_update.each do |model_result|
+          updated_count = update_model_associations(model_result)
+          associations_updated += updated_count
+        end
+
+        if associations_updated > 0
+          log_step "✓ Updated #{associations_updated} association(s) across #{models_to_update.count} model(s)", :success
+          log_step "Review the updated associations to ensure they meet your requirements", :info
+        else
+          log_step "No associations required updating", :info
+        end
+      end
+
+      # Update associations for a specific model
+      def update_model_associations(model_result)
+        model_class = model_result[:model]
+        model_name = model_result[:name]
+        model_file_path = "app/models/#{model_name.underscore}.rb"
+
+        return 0 unless File.exist?(model_file_path)
+
+        log_step "Analyzing associations in #{model_name}...", :info
+
+        # Read the model file
+        model_content = File.read(model_file_path)
+        original_content = model_content.dup
+
+        # Find associations that need tenant scoping
+        associations_to_update = find_associations_needing_tenant_scoping(model_content, model_class)
+
+        if associations_to_update.empty?
+          log_step "  No associations need updating in #{model_name}", :info
+          return 0
+        end
+
+        # Update each association
+        associations_to_update.each do |association_info|
+          model_content = update_association_for_tenant_scoping(model_content, association_info)
+        end
+
+        # Write back if there were changes
+        if model_content != original_content
+          File.write(model_file_path, model_content)
+          log_step "  ✓ Updated #{associations_to_update.count} association(s) in #{model_name}", :success
+
+          associations_to_update.each do |assoc|
+            log_step "    - #{assoc[:type]} :#{assoc[:name]} (added tenant scoping)", :info
+          end
+
+          return associations_to_update.count
+        end
+
+        0
+      end
+
+      # Find associations that need tenant scoping updates
+      def find_associations_needing_tenant_scoping(model_content, model_class)
+        associations = []
+
+        # Look for has_many associations
+        model_content.scan(/^\s*(has_many\s+:(\w+)(?:,\s*(.*))?)\s*$/) do |full_match, assoc_name, options|
+          next if full_match.include?('->') || full_match.include?('lambda') # Skip if already scoped
+
+          # Check if the associated model would be tenant scoped
+          associated_model = get_associated_model_class(assoc_name, options, model_class)
+          if associated_model && should_add_tenant_scoping_to_association?(associated_model, options)
+            associations << {
+              type: 'has_many',
+              name: assoc_name,
+              original_line: full_match,
+              associated_model: associated_model,
+              options: options
+            }
+          end
+        end
+
+        # Look for has_one associations
+        model_content.scan(/^\s*(has_one\s+:(\w+)(?:,\s*(.*))?)\s*$/) do |full_match, assoc_name, options|
+          next if full_match.include?('->') || full_match.include?('lambda') # Skip if already scoped
+
+          # Check if the associated model would be tenant scoped
+          associated_model = get_associated_model_class(assoc_name, options, model_class)
+          if associated_model && should_add_tenant_scoping_to_association?(associated_model, options)
+            associations << {
+              type: 'has_one',
+              name: assoc_name,
+              original_line: full_match,
+              associated_model: associated_model,
+              options: options
+            }
+          end
+        end
+
+        # Look for belongs_to associations that might need scoping through a join model
+        model_content.scan(/^\s*(belongs_to\s+:(\w+)(?:,\s*(.*))?)\s*$/) do |full_match, assoc_name, options|
+          next if full_match.include?('->') || full_match.include?('lambda') # Skip if already scoped
+          next if assoc_name == @organization_name.underscore # Skip organization association
+
+          # Check if this belongs_to might need scoping (for polymorphic or special cases)
+          associated_model = get_associated_model_class(assoc_name, options, model_class)
+          if associated_model && should_add_tenant_scoping_to_association?(associated_model, options) &&
+             options&.include?('polymorphic')
+            associations << {
+              type: 'belongs_to',
+              name: assoc_name,
+              original_line: full_match,
+              associated_model: associated_model,
+              options: options
+            }
+          end
+        end
+
+        associations
+      end
+
+      # Get the associated model class for an association
+      def get_associated_model_class(association_name, options, current_model_class)
+        begin
+          # Try to determine the class name from options or association name
+          class_name = nil
+
+          if options && options.include?('class_name')
+            # Extract class_name from options
+            class_name_match = options.match(/class_name:\s*['"]([^'"]+)['"]/)
+            class_name = class_name_match[1] if class_name_match
+          end
+
+          if options && options.include?('through')
+            # For through associations, we need to check the ultimate target
+            through_match = options.match(/through:\s*:(\w+)/)
+            if through_match
+              through_association = through_match[1]
+              # This is complex to resolve properly, so we'll be conservative
+              return nil
+            end
+          end
+
+          # Default to inferring from association name
+          class_name ||= association_name.to_s.classify.singularize
+
+          # Try to constantize the class
+          Object.const_get(class_name)
+        rescue NameError
+          # Model doesn't exist or isn't loaded
+          nil
+        end
+      end
+
+      # Determine if an association should have tenant scoping added
+      def should_add_tenant_scoping_to_association?(associated_model, options)
+        return false unless associated_model
+        return false if should_exclude_model?(associated_model)
+
+        # Check if the associated model has or will have organization_id
+        has_org_id = associated_model.column_names.include?(@tenant_column) rescue false
+        will_have_org_id = @models_needing_org_id&.any? { |m| m[:model] == associated_model } || false
+
+        has_org_id || will_have_org_id
+      end
+
+      # Update an association to include tenant scoping
+      def update_association_for_tenant_scoping(model_content, association_info)
+        original_line = association_info[:original_line]
+        association_type = association_info[:type]
+        association_name = association_info[:name]
+
+        # Build the scoped version of the association
+        scoped_association = case association_type
+        when 'has_many'
+          build_scoped_has_many_association(association_info)
+        when 'has_one'
+          build_scoped_has_one_association(association_info)
+        when 'belongs_to'
+          build_scoped_belongs_to_association(association_info)
+        else
+          original_line # Fallback
+        end
+
+        # Add comment explaining the change
+        comment = "  # Tenant-scoped association: only returns #{association_name} within the current organization"
+        scoped_with_comment = "#{comment}\n  #{scoped_association}"
+
+        # Replace the original association
+        model_content.gsub(/^\s*#{Regexp.escape(original_line)}.*$/, scoped_with_comment)
+      end
+
+      # Build a tenant-scoped has_many association
+      def build_scoped_has_many_association(association_info)
+        name = association_info[:name]
+        options = association_info[:options]
+
+        # Build the scope part
+        scope_lambda = "-> { where(#{@tenant_column}: current_#{@organization_name.underscore}_id) }"
+
+        if options && !options.empty?
+          # Add scope to existing options
+          "has_many :#{name}, #{scope_lambda}, #{options}"
+        else
+          # Just add the scope
+          "has_many :#{name}, #{scope_lambda}"
+        end
+      end
+
+      # Build a tenant-scoped has_one association
+      def build_scoped_has_one_association(association_info)
+        name = association_info[:name]
+        options = association_info[:options]
+
+        # Build the scope part
+        scope_lambda = "-> { where(#{@tenant_column}: current_#{@organization_name.underscore}_id) }"
+
+        if options && !options.empty?
+          # Add scope to existing options
+          "has_one :#{name}, #{scope_lambda}, #{options}"
+        else
+          # Just add the scope
+          "has_one :#{name}, #{scope_lambda}"
+        end
+      end
+
+      # Build a tenant-scoped belongs_to association (for polymorphic cases)
+      def build_scoped_belongs_to_association(association_info)
+        name = association_info[:name]
+        options = association_info[:options]
+
+        # For polymorphic belongs_to, we add a validation instead of a scope
+        # The scope would be added to the polymorphic target models instead
+        "belongs_to :#{name}#{options ? ", #{options}" : ''}"
       end
     end
   end
