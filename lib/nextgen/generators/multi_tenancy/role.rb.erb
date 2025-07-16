@@ -1,0 +1,98 @@
+# frozen_string_literal: true
+
+<% module_namespacing do -%>
+class <%= @role_name %> < ApplicationRecord
+  # Associations
+  has_many :memberships, dependent: :destroy
+  has_many :users, through: :memberships
+  has_many :organizations, through: :memberships
+
+  # Enum for role types - maps to string values in the database
+  enum :role_type, {
+    member: "member",
+    admin: "admin",
+    owner: "owner"
+  }, prefix: true, validate: true
+
+  # Validations
+  validates :name,
+    presence: true,
+    length: { minimum: 2, maximum: 50 }
+
+  validates :role_type,
+    presence: true
+
+  validates :name,
+    uniqueness: {
+      scope: :role_type,
+      message: "must be unique for each role type"
+    }
+
+  # Scopes for common queries
+  scope :by_type, ->(type) { where(role_type: type) }
+  scope :ordered, -> { order(:role_type, :name) }
+
+  # Class methods for role hierarchy checks
+  def self.admin_roles
+    where(role_type: [:admin, :owner])
+  end
+
+  def self.management_roles
+    where(role_type: [:admin, :owner])
+  end
+
+  # Instance methods for role capabilities
+  def admin?
+    role_type_admin? || role_type_owner?
+  end
+
+  def can_manage_users?
+    admin?
+  end
+
+  def can_manage_organization?
+    role_type_owner?
+  end
+
+  def can_delete_organization?
+    role_type_owner?
+  end
+
+  def can_invite_users?
+    admin?
+  end
+
+  def display_name
+    "#{name} (#{role_type.humanize})"
+  end
+
+  # Helper method to check if this role can perform action on target role
+  def can_manage_role?(target_role)
+    return false unless admin?
+    return true if role_type_owner?
+
+    # Admins can manage members but not other admins/owners
+    target_role.role_type_member?
+  end
+
+  private
+
+  # Custom validation for role hierarchy consistency
+  def validate_role_hierarchy
+    return unless role_type_changed?
+
+    # Prevent downgrading from owner if it's the last owner role
+    if role_type_was == "owner" && !role_type_owner?
+      organizations_as_last_owner = organizations.select do |org|
+        org.memberships.joins(:role).where(roles: { role_type: "owner" }).count == 1
+      end
+
+      if organizations_as_last_owner.any?
+        errors.add(:role_type, "cannot be changed - this is the last owner role for one or more organizations")
+      end
+    end
+  end
+
+  validate :validate_role_hierarchy, on: :update
+end
+<% end -%>

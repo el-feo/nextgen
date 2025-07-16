@@ -1,0 +1,64 @@
+# frozen_string_literal: true
+
+# Tenant Scoping Configuration
+#
+# This initializer sets up query monitoring for multi-tenant data isolation.
+# It ensures that unscoped queries are detected and prevented in production environments.
+
+Rails.application.configure do
+  # Setup tenant scoping query monitoring in production
+  # This monitors SQL queries to detect potential data leakage through unscoped queries
+  if Rails.env.production?
+    Rails.application.config.after_initialize do
+      TenantScoped.setup_query_monitoring!
+    end
+  end
+
+  # Enable monitoring in development/test for debugging (uncomment if needed)
+  # if Rails.env.development? || Rails.env.test?
+  #   Rails.application.config.after_initialize do
+  #     ENV['TENANT_SCOPING_MONITOR'] = 'true'
+  #     TenantScoped.setup_query_monitoring!
+  #   end
+  # end
+end
+
+# Configuration options (set via environment variables):
+#
+# TENANT_SCOPING_MONITOR=true    - Enable monitoring in non-production environments
+# TENANT_SCOPING_STRICT=true     - Raise exceptions for unscoped queries (default: just log)
+#
+# Example production deployment with strict mode:
+#   TENANT_SCOPING_STRICT=true rails server
+#
+# Monitoring and Alerting Setup:
+#
+# 1. Configure your error tracking service to capture TenantScoped::UnscopedQueryError
+# 2. Set up log monitoring for [TENANT_VIOLATION] entries
+# 3. Create metrics/dashboards for tenant scoping violations
+# 4. Set up alerts for frequent violations
+#
+# Example error tracking setup (add to application.rb or this initializer):
+#
+# if defined?(Bugsnag)
+#   Bugsnag.configure do |config|
+#     config.before_notify_callbacks << lambda do |notification|
+#       if notification.exception.is_a?(TenantScoped::UnscopedQueryError)
+#         notification.add_metadata(:tenant_scoping, {
+#           violation_type: 'unscoped_query',
+#           environment: Rails.env,
+#           timestamp: Time.current
+#         })
+#       end
+#     end
+#   end
+# end
+#
+# Example metrics setup (if using StatsD):
+#
+# ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
+#   if event.payload[:name]&.include?("[TENANT_VIOLATION]")
+#     StatsD.increment("tenant_scoping.violation",
+#       tags: { table: event.payload[:table], env: Rails.env })
+#   end
+# end

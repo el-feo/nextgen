@@ -1,0 +1,26 @@
+# frozen_string_literal: true
+
+<%
+  # Calculate migration class name
+  tenant_column_camelized = @tenant_column.split('_').map(&:capitalize).join
+
+  # Simple pluralization - handle common cases
+  if @target_table_name.end_with?('s')
+    target_table_camelized = @target_table_name.split('_').map(&:capitalize).join
+  else
+    target_table_camelized = @target_table_name.split('_').map(&:capitalize).join + 's'
+  end
+
+  migration_class_name = "Add#{tenant_column_camelized}To#{target_table_camelized}"
+%>
+class <%= migration_class_name %> < ActiveRecord::Migration[<%= @migration_version %>]
+  def change
+    # Add <%= @tenant_column %> column to <%= @target_table_name %>
+    # Using add_reference for consistency with Rails conventions
+    add_reference :<%= @target_table_name %>, :organization, null: false, foreign_key: true, index: true
+
+    # Add comment to the column for documentation
+    change_column_comment :<%= @target_table_name %>, :<%= @tenant_column %>,
+      "Foreign key to organizations table for multi-tenant data isolation"
+  end
+end

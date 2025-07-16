@@ -1,0 +1,48 @@
+<% migration_version = Rails::VERSION::MAJOR >= 5 ? "[#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}]" : "" -%>
+class Create<%= @membership_name.pluralize %> < ActiveRecord::Migration<%= migration_version %>
+  def change
+    create_table :<%= @membership_name.underscore.pluralize %> do |t|
+      # Foreign key relationships
+      t.belongs_to :user, null: false, foreign_key: true, index: true
+      t.belongs_to :<%= @organization_name.underscore %>, null: false, foreign_key: true, index: true
+      t.belongs_to :<%= @role_name.underscore %>, null: false, foreign_key: true, index: true
+
+      # Additional membership attributes
+      t.boolean :active, default: true, null: false
+      t.datetime :invited_at
+      t.datetime :joined_at
+      t.text :notes
+
+      t.timestamps null: false
+    end
+
+    # Composite indexes for performance and uniqueness
+    add_index :<%= @membership_name.underscore.pluralize %>,
+              [:user_id, :<%= @organization_name.underscore %>_id],
+              unique: true,
+              name: "index_<%= @membership_name.underscore.pluralize %>_on_user_and_<%= @organization_name.underscore %>"
+
+    add_index :<%= @membership_name.underscore.pluralize %>,
+              [:<%= @organization_name.underscore %>_id, :<%= @role_name.underscore %>_id],
+              name: "index_<%= @membership_name.underscore.pluralize %>_on_<%= @organization_name.underscore %>_and_<%= @role_name.underscore %>"
+
+    add_index :<%= @membership_name.underscore.pluralize %>,
+              [:user_id, :<%= @role_name.underscore %>_id],
+              name: "index_<%= @membership_name.underscore.pluralize %>_on_user_and_<%= @role_name.underscore %>"
+
+    # Index for active memberships (frequently queried)
+    add_index :<%= @membership_name.underscore.pluralize %>,
+              [:active, :<%= @organization_name.underscore %>_id],
+              name: "index_<%= @membership_name.underscore.pluralize %>_on_active_and_<%= @organization_name.underscore %>"
+
+    # Index for invitation management
+    add_index :<%= @membership_name.underscore.pluralize %>, :invited_at
+    add_index :<%= @membership_name.underscore.pluralize %>, :joined_at
+
+    # Ensure referential integrity with foreign key constraints
+    # These are automatically added by `foreign_key: true` above, but listed for clarity:
+    # - user_id must reference users.id
+    # - <%= @organization_name.underscore %>_id must reference <%= @organization_name.underscore.pluralize %>.id
+    # - <%= @role_name.underscore %>_id must reference <%= @role_name.underscore.pluralize %>.id
+  end
+end

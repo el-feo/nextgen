@@ -1,0 +1,145 @@
+# frozen_string_literal: true
+
+# Tenant Scoping Configuration
+#
+# This file configures the behavior of the multi-tenancy system,
+# including which models should be excluded from tenant scoping.
+
+# Configure SystemScoped models and exclusions
+if defined?(SystemScoped::Configuration)
+
+  # Models that should NEVER be tenant-scoped (system/global models)
+  # Add model class names (as strings) that should be excluded from tenant scoping
+  SystemScoped::Configuration.excluded_models = [
+    # Background job models
+    'DelayedJob',
+    'ActiveJob::QueueAdapters::DelayedJobAdapter::JobWrapper',
+
+    # Rails built-in models that should remain global
+    'ActionMailbox::InboundEmail',
+    'ActionText::RichText',
+    'ActionText::EncryptedRichText',
+    'ActiveStorage::Blob',
+    'ActiveStorage::Attachment',
+    'ActiveStorage::VariantRecord',
+
+    # Common system models (uncomment as needed)
+    # 'AuditLog',
+    # 'SystemLog',
+    # 'ActivityLog',
+    # 'SystemConfiguration',
+    # 'GlobalSetting',
+    # 'AdminUser',
+    # 'ServiceAccount',
+
+    # Reference data models (uncomment as needed)
+    # 'Country',
+    # 'State',
+    # 'Province',
+    # 'Currency',
+    # 'Timezone',
+    # 'Language',
+    # 'Translation',
+
+    # Add your custom system models here
+    # 'YourSystemModel',
+  ]
+
+  # You can also exclude models programmatically:
+  # SystemScoped::Configuration.exclude_model('SomeOtherModel')
+
+end
+
+# Configure TenantScoped behavior
+if defined?(TenantScoped)
+
+  # Enable query monitoring in production (optional)
+  # This will log warnings when unscoped queries are detected
+  if Rails.env.production?
+    TenantScoped.setup_query_monitoring!
+  end
+
+  # Enable query monitoring in development/test (optional)
+  # Useful for catching scoping issues during development
+  if Rails.env.development? || Rails.env.test?
+    # Uncomment to enable monitoring in non-production environments
+    # ENV['TENANT_SCOPING_MONITOR'] = 'true'
+    # TenantScoped.setup_query_monitoring!
+  end
+
+  # Enable strict mode (optional)
+  # This will raise exceptions instead of just logging violations
+  # WARNING: Only enable this after thorough testing
+  # ENV['TENANT_SCOPING_STRICT'] = 'true'
+
+end
+
+# Print scoping summary in development console (optional)
+if Rails.env.development? && defined?(Rails::Console)
+  Rails.application.config.after_initialize do
+    # Uncomment to see scoping summary when starting rails console
+    # TenantScoped.print_scoping_summary if defined?(TenantScoped)
+  end
+end
+
+# Custom validation logic (optional)
+# You can add custom validation logic here that runs after initialization
+Rails.application.config.after_initialize do
+
+  # Example: Validate that certain models are properly configured
+  # if defined?(User) && User.respond_to?(:tenant_scoped?) && !User.tenant_scoped?
+  #   Rails.logger.warn("[TENANT_WARNING] User model is not tenant-scoped")
+  # end
+
+  # Example: Ensure critical models have organization associations
+  # if defined?(Project) && !Project.respond_to?(:organization)
+  #   Rails.logger.error("[TENANT_ERROR] Project model missing organization association")
+  # end
+
+end
+
+# DEBUGGING HELPERS
+#
+# You can use these commands in the Rails console to debug scoping issues:
+#
+# # Print complete scoping summary
+# TenantScoped.print_scoping_summary
+#
+# # Check if a specific model is compatible with tenant scoping
+# TenantScoped.model_compatible?(YourModel)
+#
+# # Check if a model is tenant-scoped
+# TenantScoped.model_tenant_scoped?(YourModel)
+#
+# # Get all tenant-scoped models
+# TenantScoped.tenant_scoped_models.map(&:name)
+#
+# # Get all system-scoped models
+# SystemScoped::Configuration.system_scoped_models.map(&:name)
+#
+# # Check current tenant context
+# TenantScoped.current_<%= @organization_name.underscore %>_id
+# TenantScoped.current_<%= @organization_name.underscore %>&.name
+#
+# COMMON CONFIGURATION PATTERNS
+#
+# 1. Exclude all background job models:
+#    SystemScoped::Configuration.exclude_model('YourCustomJob')
+#
+# 2. Exclude reference data models:
+#    %w[Country State Currency].each do |model|
+#      SystemScoped::Configuration.exclude_model(model)
+#    end
+#
+# 3. Enable strict monitoring for staging environment:
+#    if Rails.env.staging?
+#      ENV['TENANT_SCOPING_STRICT'] = 'true'
+#      TenantScoped.setup_query_monitoring!
+#    end
+#
+# 4. Custom validation for specific models:
+#    Rails.application.config.after_initialize do
+#      if defined?(Product) && !Product.has_organization_column?
+#        Rails.logger.error("Product model needs organization_id column")
+#      end
+#    end

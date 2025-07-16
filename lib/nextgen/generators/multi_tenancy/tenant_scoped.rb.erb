@@ -1,0 +1,633 @@
+# frozen_string_literal: true
+
+# TenantScoped concern for automatic organization-based scoping
+# This concern provides automatic tenant isolation for models that include it
+module TenantScoped
+  extend ActiveSupport::Concern
+
+  # Configuration for bypass operations
+  BYPASS_AUDIT_LOG_LEVEL = :warn
+  BYPASS_ENABLED_ENVIRONMENTS = %w[development test production].freeze
+
+  # Security error class for tenant scoping violations
+  class TenantScopingError < SecurityError; end
+  class AdminAuthorizationError < TenantScopingError; end
+  class CrossTenantAccessError < TenantScopingError; end
+  class UnscopedQueryError < TenantScopingError; end
+
+  included do
+    # VALIDATION: Ensure this model is compatible with tenant scoping
+    # This validation runs when the concern is included in a model class
+    validate_tenant_scoping_compatibility!
+
+    # Add belongs_to association to the organization
+    belongs_to :<%= @organization_name.underscore %>, optional: false
+
+    # Add validation to ensure organization is present
+    validates :<%= @organization_name.underscore %>_id, presence: true
+
+    # Apply default scope to filter by current organization
+    default_scope -> {
+      if TenantScoped.current_<%= @organization_name.underscore %>_id
+        where(<%= @organization_name.underscore %>_id: TenantScoped.current_<%= @organization_name.underscore %>_id)
+      else
+        # If no organization is set, return empty relation in production to prevent data leakage
+        # In development/test, we allow unscoped queries for easier testing
+        if Rails.env.production?
+          none
+        else
+          all
+        end
+      end
+    }
+
+    # Add index for performance on organization_id column
+    # This should be added via migration when including this concern
+    # add_index table_name, :<%= @organization_name.underscore %>_id
+
+    # Ensure new records get the current organization
+    before_validation :set_current_<%= @organization_name.underscore %>, on: :create
+
+    # Add organization validation for updates as well
+    before_update :ensure_<%= @organization_name.underscore %>_not_changed
+
+    # Register this model for query monitoring
+    after_initialize do
+      TenantScoped.register_tenant_scoped_model(self.class)
+    end
+  end
+
+  # Class methods for managing organization context and providing controlled bypass operations
+  #
+  # USAGE EXAMPLES:
+  #
+  # 1. Basic bypass for data migrations:
+  #    MyModel.without_tenant_scoping { MyModel.update_all(status: 'migrated') }
+  #
+  # 2. Admin-authorized bypass:
+  #    MyModel.with_admin_bypass(
+  #      admin_check: -> { current_user&.admin? },
+  #      reason: "Cross-tenant reporting"
+  #    ) { MyModel.where(status: 'active') }
+  #
+  # 3. Cross-tenant admin operations:
+  #    MyModel.with_organization_bypass(
+  #      other_org_id,
+  #      admin_check: -> { current_user&.super_admin? }
+  #    ) { MyModel.create!(name: 'cross-tenant-record') }
+  #
+  # 4. Multi-tenant data migrations:
+  #    MyModel.for_each_organization(
+  #      admin_check: -> { current_user&.admin? }
+  #    ) do |org|
+  #      # Process each organization's data
+  #      puts "Processing #{org.name}..."
+  #    end
+  #
+  # 5. Read-only bypass for reports:
+  #    MyModel.without_tenant_scoping_readonly { MyModel.joins(:other_model).count }
+  #
+  # 6. Validation and introspection helper methods:
+  #    MyModel.tenant_scoping_active? # => true/false
+  #    MyModel.current_<%= @organization_name.underscore %> # => returns the current organization
+  #    MyModel.validate_tenant_scoping_compatibility! # => validates the model's compatibility with tenant scoping
+  #
+  module ClassMethods
+    # Temporarily bypass tenant scoping for admin operations
+    # Use with extreme caution - mainly for data migrations and admin operations
+    def without_tenant_scoping(&block)
+      # Check if bypasses are globally disabled
+      if TenantScoped.bypasses_disabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses are globally disabled"
+      end
+
+      # Environment checks
+      unless TenantScoped.bypass_enabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses not enabled in #{Rails.env} environment"
+      end
+
+      # Production safeguards and logging
+      if Rails.env.production?
+        caller_location = caller(1..3)
+        Rails.logger.warn("WARNING: Bypassing tenant scoping in production. Caller: #{caller_location}")
+
+        # Optional: Check for admin authorization in production
+        # Uncomment and implement if you have an admin authorization system
+        # unless respond_to?(:current_user) && current_user&.admin?
+        #   raise TenantScoped::AdminAuthorizationError, "Admin authorization required to bypass tenant scoping in production"
+        # end
+      end
+
+      # Log all bypass operations for audit trail
+      TenantScoped.log_bypass_operation(self.name, 'without_tenant_scoping', { caller: caller(1).first })
+
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        unscoped(&block)
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
+      end
+    end
+
+    # Safely bypass scoping with explicit admin authorization check
+    # Requires a block that returns true for authorized users
+    def with_admin_bypass(admin_check: nil, reason: nil, &block)
+      # Check if bypasses are globally disabled
+      if TenantScoped.bypasses_disabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses are globally disabled"
+      end
+
+      # Require explicit admin authorization in production
+      if Rails.env.production? && admin_check
+        unless admin_check.call
+          raise TenantScoped::AdminAuthorizationError, "Admin authorization failed for tenant scoping bypass"
+        end
+      end
+
+      # Log the bypass operation with reason
+      TenantScoped.log_bypass_operation(self.name, 'with_admin_bypass', {
+        reason: reason,
+        admin_verified: admin_check ? 'Yes' : 'No'
+      })
+
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        unscoped(&block)
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
+      end
+    end
+
+    # Bypass scoping for specific organization (admin cross-tenant operations)
+    def with_organization_bypass(<%= @organization_name.underscore %>_id, admin_check: nil, &block)
+      # Check if bypasses are globally disabled
+      if TenantScoped.bypasses_disabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses are globally disabled"
+      end
+
+      # Validate organization exists
+      <%= @organization_name.underscore %> = <%= @organization_name %>.find(<%= @organization_name.underscore %>_id)
+
+      # Require admin authorization for cross-tenant access
+      if Rails.env.production? && admin_check
+        unless admin_check.call
+          raise TenantScoped::CrossTenantAccessError, "Admin authorization required for cross-tenant access"
+        end
+      end
+
+      # Log cross-tenant access
+      TenantScoped.log_bypass_operation(self.name, 'with_organization_bypass', {
+        target_organization: <%= @organization_name.underscore %>_id,
+        admin_verified: admin_check ? 'Yes' : 'No'
+      })
+
+      # Temporarily switch organization context
+      previous_<%= @organization_name.underscore %>_id = TenantScoped.current_<%= @organization_name.underscore %>_id
+      TenantScoped.current_<%= @organization_name.underscore %>_id = <%= @organization_name.underscore %>_id
+
+      begin
+        yield
+      ensure
+        TenantScoped.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+      end
+    end
+
+    # Safe method for data migrations that need to access all organizations
+    def for_each_organization(admin_check: nil, &block)
+      # Check if bypasses are globally disabled
+      if TenantScoped.bypasses_disabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses are globally disabled"
+      end
+
+      # Require admin authorization for multi-tenant operations
+      if Rails.env.production? && admin_check
+        unless admin_check.call
+          raise TenantScoped::AdminAuthorizationError, "Admin authorization required for multi-tenant operations"
+        end
+      end
+
+      TenantScoped.log_bypass_operation(self.name, 'for_each_organization', {
+        admin_verified: admin_check ? 'Yes' : 'No'
+      })
+
+      # Clear current organization context and iterate through all organizations
+      previous_<%= @organization_name.underscore %>_id = TenantScoped.current_<%= @organization_name.underscore %>_id
+
+      begin
+        <%= @organization_name %>.find_each do |<%= @organization_name.underscore %>|
+          TenantScoped.current_<%= @organization_name.underscore %>_id = <%= @organization_name.underscore %>.id
+          Rails.logger.debug("[MULTI_TENANT] Processing organization: #{<%= @organization_name.underscore %>.id}")
+
+          yield(<%= @organization_name.underscore %>)
+        end
+      ensure
+        TenantScoped.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+      end
+    end
+
+    # Scope to a specific organization (explicitly unscoped first)
+    def for_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
+      unscoped.where(<%= @organization_name.underscore %>_id: <%= @organization_name.underscore %>.id)
+    end
+
+    # Bypass scoping for read-only operations (safer for reporting)
+    def without_tenant_scoping_readonly(&block)
+      # Check if bypasses are globally disabled
+      if TenantScoped.bypasses_disabled?
+        raise TenantScoped::TenantScopingError, "Tenant scoping bypasses are globally disabled"
+      end
+
+      TenantScoped.log_bypass_operation(self.name, 'without_tenant_scoping_readonly')
+
+      # Set flag to prevent query monitoring false positives
+      previous_bypass_flag = Thread.current[:tenant_scoping_bypass_active]
+      Thread.current[:tenant_scoping_bypass_active] = true
+
+      begin
+        # Return read-only relation to prevent accidental modifications
+        unscoped do
+          relation = yield
+          relation.respond_to?(:readonly) ? relation.readonly : relation
+        end
+      ensure
+        Thread.current[:tenant_scoping_bypass_active] = previous_bypass_flag
+      end
+    end
+
+    # Check if tenant scoping is currently active
+    def tenant_scoping_active?
+      TenantScoped.current_<%= @organization_name.underscore %>_id.present?
+    end
+
+    # Get current organization for this model
+    def current_<%= @organization_name.underscore %>
+      return nil unless TenantScoped.current_<%= @organization_name.underscore %>_id
+
+      @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.find(TenantScoped.current_<%= @organization_name.underscore %>_id)
+    end
+
+    # Check if this model is tenant-scoped (always true for models that include TenantScoped)
+    def tenant_scoped?
+      true
+    end
+
+    # Check if this model is system-scoped (always false for models that include TenantScoped)
+    def system_scoped?
+      false
+    end
+
+    # Get the scoping type for this model
+    def scoping_type
+      :tenant
+    end
+
+    # Validate that this model is compatible with tenant scoping
+    def validate_tenant_scoping_compatibility!
+      TenantScoped.validate_tenant_scoping_compatibility!(self)
+    end
+
+    # Check if this model has the required organization column
+    def has_organization_column?
+      return false unless respond_to?(:column_names)
+      column_names.include?('<%= @organization_name.underscore %>_id')
+    end
+
+    # Get all records across all organizations (admin bypass)
+    def all_organizations_unscoped
+      Rails.logger.warn("[TENANT_WARNING] Using all_organizations_unscoped on #{self.name}")
+      unscoped
+    end
+
+    # Get count of records across all organizations (admin reporting)
+    def total_count_all_organizations
+      Rails.logger.info("[TENANT_REPORTING] Getting total count across all organizations for #{self.name}")
+      unscoped.count
+    end
+  end
+
+  # Thread-safe storage for current organization context
+  # This ensures tenant isolation across concurrent requests
+  def self.current_<%= @organization_name.underscore %>_id
+    if defined?(RequestStore)
+      RequestStore.store[:current_<%= @organization_name.underscore %>_id] ||
+        Thread.current[:current_<%= @organization_name.underscore %>_id]
+    else
+      Thread.current[:current_<%= @organization_name.underscore %>_id]
+    end
+  end
+
+  def self.current_<%= @organization_name.underscore %>_id=(id)
+    RequestStore.store[:current_<%= @organization_name.underscore %>_id] = id if defined?(RequestStore)
+    Thread.current[:current_<%= @organization_name.underscore %>_id] = id
+  end
+
+  # Check if tenant scoping context is properly configured
+  def self.context_storage_available?
+    defined?(RequestStore) || Thread.current.respond_to?(:[])
+  end
+
+  # Clear all organization context (use with extreme caution)
+  def self.clear_context!
+    if Rails.env.production?
+      Rails.logger.warn("WARNING: Clearing tenant context in production. Caller: #{caller(1..3)}")
+    end
+
+    RequestStore.store[:current_<%= @organization_name.underscore %>_id] = nil if defined?(RequestStore)
+    Thread.current[:current_<%= @organization_name.underscore %>_id] = nil
+    @current_<%= @organization_name.underscore %> = nil
+  end
+
+  def self.current_<%= @organization_name.underscore %>
+    return nil unless current_<%= @organization_name.underscore %>_id
+
+    @current_<%= @organization_name.underscore %> ||= <%= @organization_name %>.unscoped.find(current_<%= @organization_name.underscore %>_id)
+  end
+
+  def self.current_<%= @organization_name.underscore %>=(<%= @organization_name.underscore %>)
+    self.current_<%= @organization_name.underscore %>_id = <%= @organization_name.underscore %>&.id
+    @current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+  end
+
+  # Set organization context for the duration of a block
+  def self.with_<%= @organization_name.underscore %>(<%= @organization_name.underscore %>)
+    previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
+    previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
+
+    self.current_<%= @organization_name.underscore %> = <%= @organization_name.underscore %>
+
+    yield
+  ensure
+    self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+    @current_<%= @organization_name.underscore %> = previous_<%= @organization_name.underscore %>
+  end
+
+  # Clear organization context (use with caution)
+  def self.without_<%= @organization_name.underscore %>
+    previous_<%= @organization_name.underscore %>_id = current_<%= @organization_name.underscore %>_id
+    previous_<%= @organization_name.underscore %> = @current_<%= @organization_name.underscore %>
+
+    self.current_<%= @organization_name.underscore %>_id = nil
+    @current_<%= @organization_name.underscore %> = nil
+
+    yield
+  ensure
+    self.current_<%= @organization_name.underscore %>_id = previous_<%= @organization_name.underscore %>_id
+    @current_<%= @organization_name.underscore %> = previous_<%= @organization_name.underscore %>
+  end
+
+  # Instance methods
+  def belongs_to_current_<%= @organization_name.underscore %>?
+    <%= @organization_name.underscore %>_id == TenantScoped.current_<%= @organization_name.underscore %>_id
+  end
+
+  def can_be_accessed_by?(<%= @organization_name.underscore %>)
+    self.<%= @organization_name.underscore %>_id == <%= @organization_name.underscore %>.id
+  end
+
+  private
+
+  def set_current_<%= @organization_name.underscore %>
+    return if <%= @organization_name.underscore %>_id.present?
+    return unless TenantScoped.current_<%= @organization_name.underscore %>_id
+
+    self.<%= @organization_name.underscore %>_id = TenantScoped.current_<%= @organization_name.underscore %>_id
+  end
+
+  def ensure_<%= @organization_name.underscore %>_not_changed
+    return unless <%= @organization_name.underscore %>_id_changed?
+
+    errors.add(:<%= @organization_name.underscore %>_id, "cannot be changed after creation")
+    throw :abort
+  end
+
+  # Validation method to ensure model compatibility with tenant scoping
+  # This is called when TenantScoped is included in a model class
+  def self.validate_tenant_scoping_compatibility!(model_class = self)
+    model_name = model_class.name
+
+    # Skip validation if SystemScoped::Configuration is not available
+    # (happens when SystemScoped hasn't been generated yet)
+    return true unless defined?(SystemScoped::Configuration)
+
+    begin
+      SystemScoped::Configuration.validate_tenant_scoping_compatibility!(model_class)
+    rescue SystemScoped::Configuration::IncompatibleModelError => e
+      Rails.logger.error("[TENANT_ERROR] #{e.message}")
+      raise TenantScopingError, e.message
+    rescue SystemScoped::Configuration::MissingColumnError => e
+      Rails.logger.error("[TENANT_ERROR] #{e.message}")
+
+      # Provide helpful guidance
+      guidance = <<~GUIDANCE
+
+        To fix this issue, you have several options:
+
+        1. Add the missing column with a migration:
+           rails generate migration Add<%= @organization_name %>ToYourModel <%= @organization_name.underscore %>:references
+           rails db:migrate
+
+        2. If this model should be global (not tenant-specific), use SystemScoped instead:
+           class #{model_name} < ApplicationRecord
+             include SystemScoped  # Remove TenantScoped
+           end
+
+        3. If this is a system model, add it to the exclusion list in an initializer:
+           SystemScoped::Configuration.exclude_model('#{model_name}')
+      GUIDANCE
+
+      raise TenantScopingError, "#{e.message}#{guidance}"
+    end
+
+    true
+  end
+
+  # Module method to validate tenant scoping compatibility
+  def self.included(base)
+    super
+
+    # Perform validation when the concern is included
+    # Delay validation until after initialization to ensure all dependencies are loaded
+    if defined?(Rails) && Rails.application
+      Rails.application.config.after_initialize do
+        begin
+          validate_tenant_scoping_compatibility!(base)
+        rescue TenantScopingError => e
+          # Re-raise with more context
+          raise TenantScopingError,
+            "Failed to include TenantScoped in #{base.name}: #{e.message}"
+        end
+      end
+    else
+      # Immediate validation if not in Rails context
+      validate_tenant_scoping_compatibility!(base)
+    end
+  end
+
+  # Error classes for better error handling
+  class ModelIncompatibilityError < TenantScopingError; end
+  class MissingColumnError < TenantScopingError; end
+
+  # Helper methods for introspection and configuration
+
+  # Check if a model class is compatible with tenant scoping
+  def self.model_compatible?(model_class)
+    return false unless model_class.respond_to?(:column_names)
+    return false if defined?(SystemScoped::Configuration) &&
+                   SystemScoped::Configuration.excluded_model?(model_class)
+    return false if model_class.respond_to?(:system_scoped?) && model_class.system_scoped?
+
+    model_class.column_names.include?('<%= @organization_name.underscore %>_id')
+  end
+
+  # Get all models that include TenantScoped
+  def self.tenant_scoped_models
+    @tenant_scoped_models ||= []
+  end
+
+  # Register a model as tenant-scoped
+  def self.register_tenant_scoped_model(model_class)
+    tenant_scoped_models << model_class unless tenant_scoped_models.include?(model_class)
+  end
+
+  # Check if a model class includes TenantScoped
+  def self.model_tenant_scoped?(model_class)
+    tenant_scoped_models.include?(model_class) ||
+      (model_class.respond_to?(:tenant_scoped?) && model_class.tenant_scoped?)
+  end
+
+  # Get summary of scoping configuration
+  def self.scoping_summary
+    summary = {
+      tenant_scoped_models: tenant_scoped_models.map(&:name),
+      system_scoped_models: [],
+      excluded_models: [],
+      total_models: 0
+    }
+
+    if defined?(SystemScoped::Configuration)
+      summary[:system_scoped_models] = SystemScoped::Configuration.system_scoped_models.map(&:name)
+      summary[:excluded_models] = SystemScoped::Configuration.excluded_models
+    end
+
+    if defined?(ApplicationRecord)
+      summary[:total_models] = ApplicationRecord.descendants.count
+    end
+
+    summary
+  end
+
+  # Print scoping configuration (useful for debugging)
+  def self.print_scoping_summary
+    summary = scoping_summary
+
+    puts "\n" + "="*60
+    puts "  TENANT SCOPING SUMMARY"
+    puts "="*60
+    puts "Total Models: #{summary[:total_models]}"
+    puts "Tenant-Scoped Models (#{summary[:tenant_scoped_models].count}):"
+    summary[:tenant_scoped_models].each { |name| puts "  • #{name}" }
+    puts "\nSystem-Scoped Models (#{summary[:system_scoped_models].count}):"
+    summary[:system_scoped_models].each { |name| puts "  • #{name}" }
+    puts "\nExcluded Models (#{summary[:excluded_models].count}):"
+    summary[:excluded_models].each { |name| puts "  • #{name}" }
+    puts "="*60
+  end
+
+end
+
+# Additional documentation and error handling examples for SystemScoped models
+#
+# SYSTEM MODELS THAT SHOULD USE SystemScoped INSTEAD OF TenantScoped:
+#
+# 1. Configuration Models:
+#    class SystemConfiguration < ApplicationRecord
+#      include SystemScoped
+#      # Global application settings that apply to all tenants
+#    end
+#
+# 2. Audit/Logging Models:
+#    class AuditLog < ApplicationRecord
+#      include SystemScoped
+#      # System-wide audit trail that spans all tenants
+#    end
+#
+# 3. Reference Data Models:
+#    class Country < ApplicationRecord
+#      include SystemScoped
+#      # Global reference data used by all tenants
+#    end
+#
+# 4. Background Job Models:
+#    class DelayedJob < ApplicationRecord
+#      include SystemScoped
+#      # Job queue that manages work for all tenants
+#    end
+#
+# 5. System User Models:
+#    class AdminUser < ApplicationRecord
+#      include SystemScoped
+#      # System administrators who can access multiple tenants
+#    end
+#
+# CONFIGURATION EXAMPLES:
+#
+# In config/initializers/tenant_scoping.rb:
+#
+#   # Exclude specific models from tenant scoping
+#   SystemScoped::Configuration.excluded_models = [
+#     'AuditLog',
+#     'SystemConfiguration',
+#     'DelayedJob',
+#     'AdminUser'
+#   ]
+#
+#   # Add individual models to exclusion list
+#   SystemScoped::Configuration.exclude_model('CustomSystemModel')
+#
+#   # Check if model is compatible with tenant scoping
+#   if TenantScoped.model_compatible?(YourModel)
+#     puts "YourModel can use TenantScoped"
+#   else
+#     puts "YourModel should use SystemScoped"
+#   end
+#
+# ERROR HANDLING EXAMPLES:
+#
+# # Model missing organization_id column:
+# class BlogPost < ApplicationRecord
+#   include TenantScoped  # ERROR: No organization_id column
+# end
+# # Fix: Add migration or use SystemScoped
+#
+# # Model with conflicting scoping:
+# class Settings < ApplicationRecord
+#   include SystemScoped
+#   include TenantScoped  # ERROR: Cannot use both
+# end
+# # Fix: Choose one scoping type
+#
+# # Model in exclusion list:
+# SystemScoped::Configuration.exclude_model('Product')
+# class Product < ApplicationRecord
+#   include TenantScoped  # ERROR: Model is excluded
+# end
+# # Fix: Use SystemScoped or remove from exclusion list
+#
+# DEBUGGING TOOLS:
+#
+# # Print scoping summary in Rails console
+# TenantScoped.print_scoping_summary
+#
+# # Check specific model compatibility
+# TenantScoped.model_compatible?(YourModel)
+# TenantScoped.model_tenant_scoped?(YourModel)
+#
+# # Get all tenant-scoped models
+# TenantScoped.tenant_scoped_models.map(&:name)
+#

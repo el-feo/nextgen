@@ -1,0 +1,145 @@
+# frozen_string_literal: true
+
+<% module_namespacing do -%>
+class <%= @membership_name %> < ApplicationRecord
+  # Associations with proper foreign key constraints
+  belongs_to :user, inverse_of: :memberships
+  belongs_to :<%= @organization_name.underscore %>, inverse_of: :memberships
+  belongs_to :<%= @role_name.underscore %>, inverse_of: :memberships
+
+  # Validations
+  validates :user_id,
+    presence: true,
+    uniqueness: {
+      scope: :<%= @organization_name.underscore %>_id,
+      message: "already has a membership in this organization"
+    }
+
+  validates :<%= @organization_name.underscore %>_id,
+    presence: true
+
+  validates :<%= @role_name.underscore %>_id,
+    presence: true
+
+  # Validate that a user cannot have multiple roles in the same organization
+  validates :user_id,
+    uniqueness: {
+      scope: [:<%= @organization_name.underscore %>_id],
+      message: "can only have one role per organization"
+    }
+
+  # Scopes for common queries
+  scope :active, -> { where(active: true) }
+  scope :inactive, -> { where(active: false) }
+  scope :by_role, ->(role) { joins(:<%= @role_name.underscore %>).where(<%= @role_name.underscore.pluralize %>: { role_type: role }) }
+  scope :admins, -> { by_role([:admin, :owner]) }
+  scope :owners, -> { by_role(:owner) }
+  scope :members, -> { by_role(:member) }
+  scope :ordered, -> { joins(:user, :<%= @role_name.underscore %>).order('users.name ASC, <%= @role_name.underscore.pluralize %>.role_type ASC') }
+
+  # Class methods for membership management
+  def self.for_organization(organization)
+    where(<%= @organization_name.underscore %>: organization)
+  end
+
+  def self.for_user(user)
+    where(user: user)
+  end
+
+  def self.with_role_type(role_type)
+    joins(:<%= @role_name.underscore %>).where(<%= @role_name.underscore.pluralize %>: { role_type: role_type })
+  end
+
+  # Instance methods for role checking
+  def admin?
+    <%= @role_name.underscore %>.admin?
+  end
+
+  def owner?
+    <%= @role_name.underscore %>.role_type_owner?
+  end
+
+  def member?
+    <%= @role_name.underscore %>.role_type_member?
+  end
+
+  def can_manage_users?
+    admin?
+  end
+
+  def can_manage_organization?
+    owner?
+  end
+
+  def can_invite_users?
+    admin?
+  end
+
+  def can_remove_users?
+    admin?
+  end
+
+  def can_manage_membership?(target_membership)
+    return false unless admin?
+    return false if target_membership == self # Cannot manage own membership
+    return true if owner?
+
+    # Admins can manage members but not other admins/owners
+    target_membership.member?
+  end
+
+  # Callback methods
+  before_save :set_defaults
+  before_destroy :ensure_not_last_owner
+
+  # Delegation for convenience
+  delegate :name, to: :user, prefix: true, allow_nil: true
+  delegate :email, to: :user, prefix: true, allow_nil: true
+  delegate :name, to: :<%= @organization_name.underscore %>, prefix: true, allow_nil: true
+  delegate :role_type, :display_name, to: :<%= @role_name.underscore %>, prefix: true, allow_nil: true
+
+  # Display methods
+  def display_name
+    "#{user_name} - #{role_display_name} in #{<%= @organization_name.underscore %>_name}"
+  end
+
+  def status_display
+    active? ? "Active" : "Inactive"
+  end
+
+  private
+
+  # Set default values
+  def set_defaults
+    self.active = true if active.nil?
+    self.invited_at ||= Time.current if user_id_changed? && user_id.present?
+  end
+
+  # Prevent deletion of the last owner in an organization
+  def ensure_not_last_owner
+    return unless owner?
+
+    other_owners = <%= @organization_name %>.find(<%= @organization_name.underscore %>_id)
+                                              .memberships
+                                              .joins(:<%= @role_name.underscore %>)
+                                              .where(<%= @role_name.underscore.pluralize %>: { role_type: 'owner' })
+                                              .where.not(id: id)
+                                              .count
+
+    if other_owners.zero?
+      errors.add(:base, "Cannot remove the last owner from the organization")
+      throw(:abort)
+    end
+  end
+
+  # Custom validation methods
+  def validate_role_hierarchy
+    return unless <%= @role_name.underscore %>_id_changed?
+
+    # Additional business logic for role changes can be added here
+    # For example, preventing certain role transitions
+  end
+
+  validate :validate_role_hierarchy, on: :update
+end
+<% end -%>

@@ -1,0 +1,64 @@
+<% migration_version = Rails::VERSION::MAJOR >= 5 ? "[#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}]" : "" -%>
+class Create<%= @organization_name.pluralize %> < ActiveRecord::Migration<%= migration_version %>
+  def change
+    create_table :<%= @organization_name.underscore.pluralize %> do |t|
+      t.string :name, null: false, limit: 100
+      t.boolean :active, default: true, null: false
+      t.text :description
+      t.string :slug, limit: 100
+      t.string :website_url, limit: 255
+      t.string :contact_email, limit: 255
+
+      t.timestamps null: false
+    end
+
+    # Primary performance indexes
+    add_index :<%= @organization_name.underscore.pluralize %>, :name
+    add_index :<%= @organization_name.underscore.pluralize %>, :active
+    add_index :<%= @organization_name.underscore.pluralize %>, :slug, unique: true
+
+    # Composite indexes for common queries
+    add_index :<%= @organization_name.underscore.pluralize %>, [:active, :name],
+              name: "index_<%= @organization_name.underscore.pluralize %>_on_active_and_name"
+
+    # Unique constraint for organization names (case-insensitive)
+    add_index :<%= @organization_name.underscore.pluralize %>,
+              "LOWER(name)",
+              unique: true,
+              name: "index_<%= @organization_name.underscore.pluralize %>_on_lower_name"
+
+    # Add check constraints for data integrity with proper rollback support
+    # These are PostgreSQL-specific but provide additional data validation
+    reversible do |direction|
+      direction.up do
+        if connection.adapter_name == 'PostgreSQL'
+          execute <<-SQL
+            ALTER TABLE <%= @organization_name.underscore.pluralize %>
+            ADD CONSTRAINT check_<%= @organization_name.underscore.pluralize %>_name_length
+            CHECK (length(name) >= 2);
+          SQL
+
+          execute <<-SQL
+            ALTER TABLE <%= @organization_name.underscore.pluralize %>
+            ADD CONSTRAINT check_<%= @organization_name.underscore.pluralize %>_slug_format
+            CHECK (slug ~ '^[a-z0-9-]+$');
+          SQL
+        end
+      end
+
+      direction.down do
+        if connection.adapter_name == 'PostgreSQL'
+          execute <<-SQL
+            ALTER TABLE <%= @organization_name.underscore.pluralize %>
+            DROP CONSTRAINT IF EXISTS check_<%= @organization_name.underscore.pluralize %>_name_length;
+          SQL
+
+          execute <<-SQL
+            ALTER TABLE <%= @organization_name.underscore.pluralize %>
+            DROP CONSTRAINT IF EXISTS check_<%= @organization_name.underscore.pluralize %>_slug_format;
+          SQL
+        end
+      end
+    end
+  end
+end
